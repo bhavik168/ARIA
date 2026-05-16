@@ -25,18 +25,18 @@
 
   <!-- ── LAYER 3: DISPATCHER AGENT ── -->
   <rect x="240" y="236" width="420" height="60" rx="10" fill="#1e1a35" stroke="#6c5ce7" stroke-width="1.5"/>
-  <text x="450" y="258" text-anchor="middle" font-size="13" font-weight="700" fill="#a89df0">Layer 3 — Dispatcher Agent</text>
-  <text x="450" y="275" text-anchor="middle" font-size="11" fill="#8878d0">Extracts location · incident type · severity · hazards</text>
-  <text x="450" y="290" text-anchor="middle" font-size="10" fill="#6655bb">Bedrock Claude Haiku — fast entity extraction</text>
+  <text x="450" y="258" text-anchor="middle" font-size="13" font-weight="700" fill="#a89df0">Layer 3 — Stream Processor + Domain Watchers</text>
+  <text x="450" y="275" text-anchor="middle" font-size="11" fill="#8878d0">Per-word pipeline · Pattern watchers · Async agent triggers · Live WebSocket feed</text>
+  <text x="450" y="290" text-anchor="middle" font-size="10" fill="#6655bb">aria-stream-processor Lambda · Provisioned Concurrency: 10 · Never batches</text>
 
   <!-- Arrow -->
   <line x1="450" y1="296" x2="450" y2="320" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
 
   <!-- ── LAYER 4: COORDINATOR AGENT ── -->
   <rect x="200" y="320" width="500" height="64" rx="10" fill="#1e1a35" stroke="#9b59b6" stroke-width="2"/>
-  <text x="450" y="343" text-anchor="middle" font-size="14" font-weight="700" fill="#cc99ff">Layer 4 — Coordinator Agent (The Brain)</text>
-  <text x="450" y="360" text-anchor="middle" font-size="11" fill="#aa88dd">Plans · Spawns 4 agents in parallel · Synthesizes results</text>
-  <text x="450" y="376" text-anchor="middle" font-size="10" fill="#8866bb">Bedrock Claude Sonnet — multi-agent orchestration</text>
+  <text x="450" y="343" text-anchor="middle" font-size="14" font-weight="700" fill="#cc99ff">Layer 4 — Coordinator Agent (Synthesizer)</text>
+  <text x="450" y="360" text-anchor="middle" font-size="11" fill="#aa88dd">Awaits agent results · Resolves conflicts · Streams progressive card updates</text>
+  <text x="450" y="376" text-anchor="middle" font-size="10" fill="#8866bb">Bedrock Claude Sonnet · Haiku verifier enriches context in parallel</text>
 
   <!-- Fan-out lines to 4 agents -->
   <path d="M310 384 L310 440 L120 440 L120 460" fill="none" stroke="#555" stroke-width="1.2" marker-end="url(#arr)"/>
@@ -104,7 +104,7 @@
   <rect x="200" y="768" width="500" height="64" rx="10" fill="#0d2b0d" stroke="#27ae60" stroke-width="1.5"/>
   <text x="450" y="791" text-anchor="middle" font-size="13" font-weight="700" fill="#2ecc71">Layer 8 — Dispatcher Dashboard</text>
   <text x="450" y="808" text-anchor="middle" font-size="11" fill="#58d68d">Single recommendation card · One-click approve / override</text>
-  <text x="450" y="824" text-anchor="middle" font-size="10" fill="#45b39d">React · API Gateway · WebSocket · Vercel</text>
+  <text x="450" y="824" text-anchor="middle" font-size="10" fill="#45b39d">React · API Gateway WebSocket · Vercel · Progressive field-by-field rendering</text>
 
   <!-- Arrow to outputs -->
   <line x1="450" y1="832" x2="450" y2="862" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
@@ -138,7 +138,26 @@
   <!-- Footer -->
   <text x="450" y="1010" text-anchor="middle" font-size="11" fill="#555555">ARIA — AWSHacks 2026 · Bedrock Track · Build with Gratitude</text>
   <text x="450" y="1028" text-anchor="middle" font-size="10" fill="#444444">All agent actions require human dispatcher approval · No auto-execution · Bedrock Guardrails enforced at every step</text>
-  <text x="450" y="1050" text-anchor="middle" font-size="10" fill="#444444">Claude Haiku (speed) → Claude Sonnet (reasoning) → RAG Knowledge Base → Guardrails → Human decision</text>
+  <text x="450" y="1050" text-anchor="middle" font-size="10" fill="#444444">Stream Processor + Domain Watchers → Agents (async) → Haiku Verifier → Sonnet Synthesizer → RAG · Guardrails → Human decision</text>
+
+  <!-- ── CLAUDE HAIKU VERIFIER (parallel, never gating) ── -->
+  <rect x="8" y="294" width="144" height="66" rx="8" fill="#1e1a35" stroke="#6c5ce7" stroke-width="1" stroke-dasharray="5 3"/>
+  <text x="80" y="314" text-anchor="middle" font-size="10" font-weight="700" fill="#a89df0">Claude Haiku 3.5</text>
+  <text x="80" y="328" text-anchor="middle" font-size="9" fill="#8878d0">Verifier — parallel, not gating</text>
+  <text x="80" y="342" text-anchor="middle" font-size="9" fill="#8878d0">Resolves ambiguities</text>
+  <text x="80" y="356" text-anchor="middle" font-size="9" fill="#6655bb">enriches agent context mid-run</text>
+  <line x1="152" y1="348" x2="200" y2="356" stroke="#6c5ce7" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+  <!-- ── WEBSOCKET SPINE (right side — every word + every agent result) ── -->
+  <line x1="876" y1="248" x2="876" y2="800" stroke="#2ecc71" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="876" y="524" text-anchor="middle" font-size="9" fill="#2ecc71" transform="rotate(-90 876 524)">WebSocket — live words + agent results → dashboard</text>
+  <!-- Stream Processor → WebSocket spine -->
+  <line x1="660" y1="266" x2="870" y2="266" stroke="#2ecc71" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+  <!-- WebSocket spine → Layer 8 Dashboard -->
+  <line x1="870" y1="800" x2="700" y2="800" stroke="#2ecc71" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+  <!-- Domain watcher trigger annotation -->
+  <text x="450" y="453" text-anchor="middle" font-size="9" fill="#777777">async domain watcher triggers</text>
 
   <!-- Arrow marker definition -->
   <defs>
