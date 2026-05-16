@@ -178,3 +178,6 @@ caller_data/
 # ── Demo / seed data (keep synthetic, not real) ──
 data/production/
 seed_data/production/
+
+# ── Documentation ──
+docs/
