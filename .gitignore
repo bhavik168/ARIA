@@ -1,0 +1,180 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+.installed.cfg
+lib/
+lib64/
+
+# ── Virtual environments ──
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ── Environment variables / secrets ──
+.env
+.env.local
+.env.development
+.env.staging
+.env.production
+.env.test
+*.env
+secrets.json
+secrets.yaml
+secrets.yml
+
+# ── AWS credentials ──
+.aws/
+aws-credentials.json
+aws_credentials.json
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# ── AWS CDK ──
+cdk.out/
+cdk.context.json
+.cdk.staging/
+
+# ── AWS SAM ──
+.aws-sam/
+samconfig.toml
+
+# ── Terraform (if used) ──
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
+
+# ── Node / React frontend ──
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.npm
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+dist/
+build/
+.next/
+out/
+
+# ── React / Vite build outputs ──
+/frontend/dist
+/frontend/build
+/dashboard/dist
+/dashboard/build
+
+# ── Bedrock / AI ──
+*.model
+*.bin
+*.safetensors
+embeddings_cache/
+vector_store/
+.bedrock_cache/
+
+# ── Lambda build artifacts ──
+lambda/*/package/
+lambda/*/.build/
+*.zip
+layer.zip
+deployment-package.zip
+function.zip
+
+# ── Logs ──
+*.log
+logs/
+log/
+*.log.*
+npm-debug.log
+pip-log.txt
+
+# ── Testing ──
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+junit.xml
+test-results/
+test_output/
+
+# ── IDEs ──
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+
+# ── macOS ──
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ── Windows ──
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Local config overrides ──
+local_config.py
+local_settings.py
+config.local.json
+config.local.yaml
+
+# ── Incident data / PII (never commit real 911 data) ──
+data/real/
+data/incidents/
+data/pii/
+transcripts/
+*.transcript
+*.incident
+caller_data/
+
+# ── Demo / seed data (keep synthetic, not real) ──
+data/production/
+seed_data/production/
