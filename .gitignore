@@ -6,8 +6,6 @@ __pycache__/
 .Python
 *.egg
 *.egg-info/
-dist/
-build/
 eggs/
 parts/
 var/
@@ -18,12 +16,9 @@ wheels/
 pip-log.txt
 pip-delete-this-directory.txt
 .installed.cfg
-lib/
-lib64/
 
 # ── Virtual environments ──
-.env
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -54,19 +49,14 @@ aws_credentials.json
 
 # ── AWS CDK ──
 cdk.out/
+infrastructure/cdk/cdk.out/
+infrastructure/cdk/.cdk.staging/
 cdk.context.json
-.cdk.staging/
 
 # ── AWS SAM ──
+infrastructure/sam/.aws-sam/
 .aws-sam/
 samconfig.toml
-
-# ── Terraform (if used) ──
-.terraform/
-*.tfstate
-*.tfstate.backup
-*.tfvars
-.terraform.lock.hcl
 
 # ── Node / React frontend ──
 node_modules/
@@ -80,16 +70,23 @@ yarn-error.log*
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
-dist/
-build/
-.next/
-out/
 
-# ── React / Vite build outputs ──
-/frontend/dist
-/frontend/build
-/dashboard/dist
-/dashboard/build
+# ── Frontend build outputs ──
+frontend/dist/
+frontend/build/
+frontend/.next/
+frontend/out/
+
+# ── Lambda build artifacts (matches backend/lambdas/* structure) ──
+backend/lambdas/*/package/
+backend/lambdas/*/.build/
+backend/lambdas/*/__pycache__/
+backend/lambdas/*/.pytest_cache/
+backend/lambdas/*/dist/
+*.zip
+layer.zip
+deployment-package.zip
+function.zip
 
 # ── Bedrock / AI ──
 *.model
@@ -99,21 +96,24 @@ embeddings_cache/
 vector_store/
 .bedrock_cache/
 
-# ── Lambda build artifacts ──
-lambda/*/package/
-lambda/*/.build/
-*.zip
-layer.zip
-deployment-package.zip
-function.zip
+# ── Audio samples (never commit real 911 audio) ──
+audio-samples/911-calls/*.wav
+audio-samples/911-calls/*.mp3
+audio-samples/911-calls/*.flac
+audio-samples/911-calls/*.m4a
+audio-samples/911-calls/*.ogg
+audio-samples/911-calls/*.aac
+
+# ── Knowledge base source documents (large files, not for git) ──
+knowledge-base/**/*.pdf
+knowledge-base/**/*.docx
+knowledge-base/**/*.xlsx
 
 # ── Logs ──
 *.log
 logs/
 log/
 *.log.*
-npm-debug.log
-pip-log.txt
 
 # ── Testing ──
 .pytest_cache/
@@ -136,8 +136,6 @@ test_output/
 *.swp
 *.swo
 *~
-.DS_Store
-Thumbs.db
 *.sublime-project
 *.sublime-workspace
 
@@ -175,9 +173,9 @@ transcripts/
 *.incident
 caller_data/
 
-# ── Demo / seed data (keep synthetic, not real) ──
+# ── Demo seed data (production only, not for repo) ──
 data/production/
 seed_data/production/
 
-# ── Documentation ──
-docs/
+# ── Claude Code ──
+.claude/
