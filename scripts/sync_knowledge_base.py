@@ -14,7 +14,7 @@ import os
 import sys
 import time
 
-REGION = "us-east-1"
+REGION = os.environ.get("AWS_REGION", "us-west-2")
 
 
 def get_kb_config() -> tuple:

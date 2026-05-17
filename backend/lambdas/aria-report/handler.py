@@ -25,11 +25,18 @@ ARIA_BUCKET = os.environ.get("ARIA_BUCKET", "")
 REPORTS_PREFIX = "reports"
 WS_ENDPOINT = os.environ.get("WS_ENDPOINT", "")
 
-REPORT_MODEL_ID = "anthropic.claude-sonnet-4-20250514"
+REPORT_MODEL_ID = os.environ.get(
+    "REPORT_MODEL_ID",
+    "us.anthropic.claude-sonnet-4-20250514-v1:0",
+)
 
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    # Bedrock Agent action group invocation
+    if event.get("messageVersion") == "1.0" and "actionGroup" in event:
+        return _handle_agent_action(event)
+
     t0 = int(time.time() * 1000)
     incident_id = event.get("incident_id", "")
     action = event.get("action", "generate_report")
@@ -50,7 +57,7 @@ def lambda_handler(event, context):
     md_key = f"reports/{incident_id}/report.md"
 
     _write_to_s3(report_key, json.dumps(report, indent=2, default=str))
-    _write_to_s3(md_key, _render_markdown(report))
+    _write_to_s3(md_key, _render_markdown(report, incident))
     _index_report(incident_id, report_key, md_key)
 
     elapsed_ms = int(time.time() * 1000) - t0
@@ -64,6 +71,38 @@ def lambda_handler(event, context):
     })
 
     return {"status": "ok", "incident_id": incident_id, "report_url": report_url, "elapsed_ms": elapsed_ms}
+
+
+def _handle_agent_action(event: dict) -> dict:
+    """Handle Bedrock Agent action group invocation (generate_after_action_report function)."""
+    params = {p["name"]: p["value"] for p in event.get("parameters", [])}
+    incident_id = params.get("incident_id", "")
+
+    logger.info("Report agent action invoked", extra={"incident_id": incident_id})
+
+    incident = _load_full_incident(incident_id)
+    report = _generate_report(incident)
+    report_key = f"reports/{incident_id}/report.json"
+    md_key = f"reports/{incident_id}/report.md"
+    _write_to_s3(report_key, json.dumps(report, indent=2, default=str))
+    _write_to_s3(md_key, _render_markdown(report, incident))
+    _index_report(incident_id, report_key, md_key)
+
+    report_url = f"s3://{ARIA_BUCKET}/{report_key}" if ARIA_BUCKET else ""
+    _push_to_dashboard(incident_id, {"type": "report_generated", "report_url": report_url, "incident_id": incident_id})
+
+    return {
+        "messageVersion": "1.0",
+        "response": {
+            "actionGroup": event.get("actionGroup"),
+            "function": event.get("function"),
+            "functionResponse": {
+                "responseBody": {
+                    "TEXT": {"body": json.dumps({"status": "ok", "incident_id": incident_id, "report_url": report_url}, default=str)}
+                }
+            },
+        },
+    }
 
 
 def _load_full_incident(incident_id: str) -> dict:
@@ -111,7 +150,54 @@ def _calc_response_time(incident: dict) -> int:
     return 0
 
 
-def _render_markdown(report: dict) -> str:
+def _render_markdown(report: dict, incident: dict) -> str:
+    """Call Claude Sonnet to write an AI-authored after-action report narrative."""
+    incident_summary = json.dumps({
+        "incident_id": incident.get("incident_id"),
+        "incident_type": incident.get("incident_type", "unknown"),
+        "severity": incident.get("severity", "unknown"),
+        "transcript_excerpt": incident.get("recommendation_card", {}).get("summary", ""),
+        "dispatcher_action_taken": incident.get("recommendation_card", {}).get("dispatcher_action"),
+        "ai_reasoning": incident.get("recommendation_card", {}).get("reasoning_summary"),
+        "recommendation_card": incident.get("recommendation_card"),
+        "navigation_result": incident.get("navigation_result"),
+        "medical_result": incident.get("medical_result"),
+        "hazmat_result": incident.get("hazmat_result"),
+        "verifier_classification": incident.get("verifier_classification"),
+        "dispatcher_approved": incident.get("dispatcher_approved", False),
+        "total_response_time_ms": report.get("total_response_time_ms", 0),
+        "timeline": report.get("timeline"),
+    }, default=str)
+
+    prompt = (
+        "You are ARIA, an AI emergency dispatch system. Write a professional, factual after-action report "
+        "for the following 911 incident in markdown format. Include: an executive summary, a chronological "
+        "timeline of AI agent actions, the recommendation that was surfaced to the dispatcher, "
+        "dispatcher decision, and one key lesson or observation. Use professional emergency services language.\n\n"
+        f"INCIDENT DATA:\n{incident_summary}\n\n"
+        "Write the full markdown report now. Use ## headers, bullet points, and a clean structure."
+    )
+
+    try:
+        resp = bedrock_runtime.invoke_model(
+            modelId=REPORT_MODEL_ID,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 2048,
+                "temperature": 0.2,
+                "messages": [{"role": "user", "content": prompt}],
+            }),
+            contentType="application/json",
+            accept="application/json",
+        )
+        raw = json.loads(resp["body"].read())
+        return raw["content"][0]["text"].strip()
+    except Exception as e:
+        logger.error("Sonnet report generation failed — using fallback template", exc_info=e)
+        return _render_markdown_fallback(report)
+
+
+def _render_markdown_fallback(report: dict) -> str:
     iid = report.get("incident_id", "UNKNOWN")
     itype = report.get("incident_type", "unknown")
     severity = report.get("severity", "unknown")

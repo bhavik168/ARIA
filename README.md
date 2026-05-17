@@ -170,45 +170,107 @@ When 15 callers report the same highway pile-up, each sees a different part. ARI
 ## Quick Start
 
 ### What You Need
-- AWS Account with access to `us-west-2` (Oregon)
+- AWS account with access to **us-west-2** (Oregon)
+- AWS CLI configured (`aws configure`)
 - Node.js 18+ and npm
 - Python 3.12
-- Google Maps API key
-- Mapbox token (for dashboard)
+- Google Maps API key (for unit ETA calculations)
+- Mapbox token (for the live map in the dashboard)
+
+---
 
 ### 1. Enable Bedrock Model Access
-1. Go to **Amazon Bedrock -> Model access**
-2. Enable:
-   - **Anthropic -> Claude Haiku 3.5**
-   - **Anthropic -> Claude Sonnet 4**
-   - **Amazon -> Titan Text Embeddings V2**
 
-### 2. Deploy AWS Infrastructure
-Follow the step-by-step manual setup guide in [`docs/INFRASTRUCTURE.md`](docs/INFRASTRUCTURE.md), which covers:
-- 5 DynamoDB tables
-- 1 S3 bucket
-- 10 IAM roles (least-privilege)
-- 10 Lambda functions with provisioned concurrency
-- REST API + WebSocket API via API Gateway
-- Mock Hospital API simulation
+> Do this first — approval takes a few minutes and nothing else works without it.
 
-### 3. Seed Demo Data
+1. Open **Amazon Bedrock → Model access** in the AWS console (us-west-2)
+2. Click **Manage model access** and enable:
+   - **Anthropic → Claude Haiku 3.5**
+   - **Anthropic → Claude Sonnet 4**
+   - **Amazon → Titan Text Embeddings V2**
+3. Wait for status to show **Access granted** before continuing
+
+---
+
+### 2. Deploy AWS Infrastructure (CDK)
+
+Everything — DynamoDB tables, S3 bucket, 10 Lambda functions, REST API, WebSocket API, Bedrock Agents, Knowledge Base, and Guardrails — is deployed in a single `cdk deploy`.
+
+```bash
+# Clone and enter the repo
+git clone https://github.com/your-org/aria.git
+cd aria
+
+# Install CDK globally (skip if already installed)
+npm install -g aws-cdk
+
+# Create and activate the Python venv for CDK
+python3 -m venv infrastructure/.venv
+source infrastructure/.venv/bin/activate          # Windows: infrastructure\.venv\Scripts\activate
+pip install -r infrastructure/requirements.txt
+
+# Bootstrap CDK in your account (one-time per account/region)
+cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/us-west-2
+
+# Deploy — pass your Google Maps API key as a context variable
+cdk deploy -c google_maps_api_key=YOUR_GOOGLE_MAPS_KEY
+```
+
+When the deploy finishes, CDK prints a **Outputs** block with your REST API URL, WebSocket URL, and resource IDs. Save these — you'll need them in the next steps.
+
+---
+
+### 3. Create the Knowledge Base Vector Index
+
+The CDK creates the OpenSearch Serverless collection, but the vector index must be initialized before documents can be ingested:
+
 ```bash
 pip install boto3
+python scripts/setup_kb_index.py
+```
+
+The script auto-discovers the collection endpoint from CloudFormation outputs. If it can't find it, pass it explicitly:
+
+```bash
+python scripts/setup_kb_index.py --collection-endpoint https://your-id.us-west-2.aoss.amazonaws.com
+```
+
+---
+
+### 4. Upload Knowledge Base Documents and Sync
+
+```bash
+# Upload the bundled emergency protocol documents to S3
+python scripts/upload_kb_docs.py
+
+# Trigger Bedrock ingestion (--wait polls until complete, ~2-3 min)
+python scripts/sync_knowledge_base.py --wait
+```
+
+---
+
+### 5. Seed Demo Data
+
+```bash
 python scripts/seed_units.py
 ```
 
-### 4. Run the Dispatcher Dashboard
+This populates the `aria-units` and `aria-hospitals` tables with Seattle / King County mock data.
+
+---
+
+### 6. Run the Dispatcher Dashboard
+
 ```bash
 cd frontend
 npm install
 ```
 
-Create `frontend/.env.local`:
+Create `frontend/.env` from the CDK outputs:
 ```bash
-VITE_API_URL=https://{your-rest-api}.execute-api.us-west-2.amazonaws.com/prod
-VITE_WS_URL=wss://{your-ws-api}.execute-api.us-west-2.amazonaws.com/prod
-VITE_MAPBOX_TOKEN={your-mapbox-token}
+VITE_API_BASE_URL=https://{RestApiUrl-from-CDK-outputs}
+VITE_WS_URL=wss://{WebSocketUrl-from-CDK-outputs}
+VITE_MAPBOX_TOKEN=your_mapbox_token
 ```
 
 ```bash
@@ -216,6 +278,16 @@ npm run dev
 ```
 
 Open `http://localhost:5173`. Your dispatcher dashboard is live.
+
+---
+
+### Tear Down
+
+```bash
+cdk destroy
+```
+
+> Note: DynamoDB tables and the S3 bucket have `RETAIN` removal policy — they are not deleted on destroy to protect incident data. Remove them manually from the AWS console if needed.
 
 ---
 

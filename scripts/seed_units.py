@@ -10,7 +10,9 @@ import argparse
 import boto3
 import sys
 
-REGION = "us-east-1"
+import os
+
+REGION = os.environ.get("AWS_REGION", "us-west-2")
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
 
 # Seattle / King County area units (lat/lng are real Seattle neighborhoods)
@@ -56,7 +58,7 @@ MOCK_UNITS = [
 # Seattle / King County hospitals
 MOCK_HOSPITALS = [
     {
-        "hospital_id": "H001", "region": "us-east-1",
+        "hospital_id": "H001", "region": "us-west-2",
         "name": "Harborview Medical Center",
         "address": "325 9th Ave, Seattle, WA 98104",
         "lat": 47.6027, "lng": -122.3209,
@@ -67,7 +69,7 @@ MOCK_HOSPITALS = [
         "notes": "Only Level 1 trauma center in Pacific Northwest. Only burn center in WA.",
     },
     {
-        "hospital_id": "H002", "region": "us-east-1",
+        "hospital_id": "H002", "region": "us-west-2",
         "name": "UW Medical Center",
         "address": "1959 NE Pacific St, Seattle, WA 98195",
         "lat": 47.6498, "lng": -122.3072,
@@ -77,7 +79,7 @@ MOCK_HOSPITALS = [
         "notes": "Primary overflow for Harborview. Strong cardiac and neuro. NICU.",
     },
     {
-        "hospital_id": "H003", "region": "us-east-1",
+        "hospital_id": "H003", "region": "us-west-2",
         "name": "Swedish Medical Center — First Hill",
         "address": "747 Broadway, Seattle, WA 98122",
         "lat": 47.6085, "lng": -122.3218,
@@ -87,7 +89,7 @@ MOCK_HOSPITALS = [
         "notes": "Strong cardiac program. Stroke team 24/7. Close to downtown.",
     },
     {
-        "hospital_id": "H004", "region": "us-east-1",
+        "hospital_id": "H004", "region": "us-west-2",
         "name": "Seattle Children's Hospital",
         "address": "4800 Sand Point Way NE, Seattle, WA 98105",
         "lat": 47.6632, "lng": -122.2973,
@@ -98,7 +100,7 @@ MOCK_HOSPITALS = [
         "notes": "All pediatric emergencies. Level 1 pediatric trauma.",
     },
     {
-        "hospital_id": "H005", "region": "us-east-1",
+        "hospital_id": "H005", "region": "us-west-2",
         "name": "Overlake Medical Center",
         "address": "1035 116th Ave NE, Bellevue, WA 98004",
         "lat": 47.6138, "lng": -122.1969,

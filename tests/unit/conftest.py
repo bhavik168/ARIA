@@ -26,6 +26,7 @@ os.environ.setdefault("HAZMAT_FUNCTION", "aria-hazmat-tool")
 os.environ.setdefault("REPORT_FUNCTION", "aria-report")
 os.environ.setdefault("MOCK_HOSPITAL_FUNCTION", "aria-mock-hospital")
 os.environ.setdefault("STREAM_PROCESSOR_FUNCTION", "aria-stream-processor")
+os.environ.setdefault("VERIFIER_FUNCTION", "aria-verifier")
 
 os.environ.setdefault("BEDROCK_KB_ID", "")
 os.environ.setdefault("WS_ENDPOINT", "")

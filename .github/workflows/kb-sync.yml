@@ -1,0 +1,39 @@
+name: KB Sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "knowledge-base/**"
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  sync:
+    name: Upload docs + trigger Bedrock ingestion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload KB docs to S3
+        run: python scripts/upload_kb_docs.py
+
+      - name: Trigger Bedrock ingestion and wait
+        run: python scripts/sync_knowledge_base.py --wait

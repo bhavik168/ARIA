@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-REGION = "us-east-1"
+REGION = os.environ.get("AWS_REGION", "us-west-2")
 KB_LOCAL_DIR = Path(__file__).parent.parent / "knowledge-base"
 S3_PREFIX = "knowledge-base"
 

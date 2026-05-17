@@ -12,6 +12,7 @@ Usage:
 import argparse
 import boto3
 import json
+import os
 import sys
 import urllib.request
 import urllib.parse
@@ -19,7 +20,7 @@ import hmac
 import hashlib
 import datetime
 
-REGION = "us-east-1"
+REGION = os.environ.get("AWS_REGION", "us-west-2")
 INDEX_NAME = "aria-kb-index"
 INDEX_BODY = {
     "settings": {

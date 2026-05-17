@@ -28,6 +28,7 @@ COORDINATOR_FUNCTION = os.environ.get("COORDINATOR_FUNCTION", "aria-coordinator"
 NAVIGATION_FUNCTION = os.environ.get("NAVIGATION_FUNCTION", "aria-navigation-tool")
 MEDICAL_FUNCTION = os.environ.get("MEDICAL_FUNCTION", "aria-medical-tool")
 HAZMAT_FUNCTION = os.environ.get("HAZMAT_FUNCTION", "aria-hazmat-tool")
+VERIFIER_FUNCTION = os.environ.get("VERIFIER_FUNCTION", "aria-verifier")
 WS_ENDPOINT = os.environ.get("WS_ENDPOINT", "")
 
 # ─── Domain Watcher Patterns ─────────────────────────────────────────────────
@@ -70,6 +71,20 @@ SEVERITY_KEYWORDS = frozenset({
 _context_buffer: dict[str, str] = {}
 _watcher_fired: dict[str, set] = {}  # incident_id → set of fired watcher names
 _word_count: dict[str, int] = {}
+_word_count_at_fire: dict[str, dict[str, int]] = {}  # incident_id → {watcher: word_count when last fired}
+
+# Watchers re-fire if this many new words arrive after the previous fire and conditions still match.
+# This surfaces new information (e.g., a second injury, an escalating hazmat situation) to agents.
+REFIRE_THRESHOLD = 40
+
+
+def _should_refire(incident_id: str, watcher: str, current_count: int) -> bool:
+    last = _word_count_at_fire.get(incident_id, {}).get(watcher)
+    return last is not None and (current_count - last) >= REFIRE_THRESHOLD
+
+
+def _record_fire(incident_id: str, watcher: str, current_count: int) -> None:
+    _word_count_at_fire.setdefault(incident_id, {})[watcher] = current_count
 
 
 @logger.inject_lambda_context
@@ -92,6 +107,11 @@ def lambda_handler(event, context):
     if _word_count[incident_id] % 10 == 0:
         _checkpoint_context(incident_id, context_so_far, timestamp_ms)
 
+    # Async semantic verifier every 10 words — runs AI classification in parallel
+    # This catches phrases the hardcoded keyword watchers miss (e.g., "my leg is busted")
+    if _word_count[incident_id] % 10 == 0:
+        _fire_verifier(incident_id, context_so_far, timestamp_ms)
+
     # Step 2 — Push word to dashboard WebSocket
     _push_to_dashboard(incident_id, {
         "type": "transcript_word",
@@ -102,35 +122,68 @@ def lambda_handler(event, context):
     })
 
     # Step 3 — Run domain watchers in-process
+    # Watchers fire on first match; they re-fire after REFIRE_THRESHOLD new words if
+    # conditions still hold, so agents receive updated context (e.g. new symptoms, new address).
     fired = _watcher_fired.setdefault(incident_id, set())
     context_lower = context_so_far.lower()
+    current_count = _word_count[incident_id]
 
-    if "location" not in fired and _check_location(context_lower):
-        fired.add("location")
-        logger.info("LocationWatcher fired", extra={"incident_id": incident_id})
-        metrics.add_metric("watcher_location_fired_ms", unit=MetricUnit.Milliseconds, value=timestamp_ms)
-        _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "location_detected", timestamp_ms)
+    if _check_location(context_lower):
+        if "location" not in fired:
+            fired.add("location")
+            _record_fire(incident_id, "location", current_count)
+            logger.info("LocationWatcher fired", extra={"incident_id": incident_id})
+            metrics.add_metric("watcher_location_fired_ms", unit=MetricUnit.Milliseconds, value=timestamp_ms)
+            _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "location_detected", timestamp_ms)
+        elif _should_refire(incident_id, "location", current_count):
+            _record_fire(incident_id, "location", current_count)
+            logger.info("LocationWatcher re-fired (new context)", extra={"incident_id": incident_id})
+            _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "location_updated", timestamp_ms)
 
-    if "medical" not in fired and _check_keywords(context_lower, MEDICAL_KEYWORDS):
-        fired.add("medical")
-        logger.info("MedicalWatcher fired", extra={"incident_id": incident_id})
-        metrics.add_metric("watcher_medical_fired_ms", unit=MetricUnit.Milliseconds, value=timestamp_ms)
-        _fire_agent(MEDICAL_FUNCTION, incident_id, context_so_far, "medical_keyword_detected", timestamp_ms)
+    if _check_keywords(context_lower, MEDICAL_KEYWORDS):
+        if "medical" not in fired:
+            fired.add("medical")
+            _record_fire(incident_id, "medical", current_count)
+            logger.info("MedicalWatcher fired", extra={"incident_id": incident_id})
+            metrics.add_metric("watcher_medical_fired_ms", unit=MetricUnit.Milliseconds, value=timestamp_ms)
+            _fire_agent(MEDICAL_FUNCTION, incident_id, context_so_far, "medical_keyword_detected", timestamp_ms)
+        elif _should_refire(incident_id, "medical", current_count):
+            _record_fire(incident_id, "medical", current_count)
+            logger.info("MedicalWatcher re-fired (new context)", extra={"incident_id": incident_id})
+            _fire_agent(MEDICAL_FUNCTION, incident_id, context_so_far, "medical_updated", timestamp_ms)
 
-    if "fire" not in fired and _check_keywords(context_lower, FIRE_KEYWORDS):
-        fired.add("fire")
-        logger.info("FireWatcher fired", extra={"incident_id": incident_id})
-        _fire_agent(HAZMAT_FUNCTION, incident_id, context_so_far, "fire_keyword_detected", timestamp_ms)
+    if _check_keywords(context_lower, FIRE_KEYWORDS):
+        if "fire" not in fired:
+            fired.add("fire")
+            _record_fire(incident_id, "fire", current_count)
+            logger.info("FireWatcher fired", extra={"incident_id": incident_id})
+            _fire_agent(HAZMAT_FUNCTION, incident_id, context_so_far, "fire_keyword_detected", timestamp_ms)
+        elif _should_refire(incident_id, "fire", current_count):
+            _record_fire(incident_id, "fire", current_count)
+            logger.info("FireWatcher re-fired (new context)", extra={"incident_id": incident_id})
+            _fire_agent(HAZMAT_FUNCTION, incident_id, context_so_far, "fire_updated", timestamp_ms)
 
-    if "hazmat" not in fired and _check_keywords(context_lower, HAZMAT_KEYWORDS):
-        fired.add("hazmat")
-        logger.info("HazmatWatcher fired", extra={"incident_id": incident_id})
-        _fire_agent(HAZMAT_FUNCTION, incident_id, context_so_far, "hazmat_keyword_detected", timestamp_ms)
+    if _check_keywords(context_lower, HAZMAT_KEYWORDS):
+        if "hazmat" not in fired:
+            fired.add("hazmat")
+            _record_fire(incident_id, "hazmat", current_count)
+            logger.info("HazmatWatcher fired", extra={"incident_id": incident_id})
+            _fire_agent(HAZMAT_FUNCTION, incident_id, context_so_far, "hazmat_keyword_detected", timestamp_ms)
+        elif _should_refire(incident_id, "hazmat", current_count):
+            _record_fire(incident_id, "hazmat", current_count)
+            logger.info("HazmatWatcher re-fired (new context)", extra={"incident_id": incident_id})
+            _fire_agent(HAZMAT_FUNCTION, incident_id, context_so_far, "hazmat_updated", timestamp_ms)
 
-    if "crime" not in fired and _check_keywords(context_lower, CRIME_KEYWORDS):
-        fired.add("crime")
-        logger.info("CrimeWatcher fired", extra={"incident_id": incident_id})
-        _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "crime_keyword_detected", timestamp_ms)
+    if _check_keywords(context_lower, CRIME_KEYWORDS):
+        if "crime" not in fired:
+            fired.add("crime")
+            _record_fire(incident_id, "crime", current_count)
+            logger.info("CrimeWatcher fired", extra={"incident_id": incident_id})
+            _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "crime_keyword_detected", timestamp_ms)
+        elif _should_refire(incident_id, "crime", current_count):
+            _record_fire(incident_id, "crime", current_count)
+            logger.info("CrimeWatcher re-fired (new context)", extra={"incident_id": incident_id})
+            _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "crime_updated", timestamp_ms)
 
     return {"status": "ok", "word": word, "watchers_fired": list(fired)}
 
@@ -160,6 +213,26 @@ def _fire_agent(function_name: str, incident_id: str, context: str, trigger_reas
         )
     except Exception as e:
         logger.error(f"Failed to fire agent {function_name}", exc_info=e)
+
+
+def _fire_verifier(incident_id: str, context: str, ts: int) -> None:
+    """Async invoke semantic verifier — zero latency impact on word stream."""
+    if not VERIFIER_FUNCTION:
+        return
+    payload = {
+        "incident_id": incident_id,
+        "context_so_far": context,
+        "timestamp_ms": ts,
+        "source": "stream_processor",
+    }
+    try:
+        lambda_client.invoke(
+            FunctionName=VERIFIER_FUNCTION,
+            InvocationType="Event",  # async — verifier runs in background
+            Payload=json.dumps(payload).encode(),
+        )
+    except Exception as e:
+        logger.error("Failed to fire verifier", exc_info=e)
 
 
 def _checkpoint_context(incident_id: str, context: str, ts: int) -> None:

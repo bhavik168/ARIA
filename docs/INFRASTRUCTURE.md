@@ -779,7 +779,7 @@ Go back to all 6 functions that have a `WS_ENDPOINT` env var and fill it in:
 Once everything above is done, run this from your laptop to populate the units and hospitals tables:
 
 ```bash
-cd /Users/bhavikmehta168/Desktop/ARIA
+cd ~/aria   # or wherever you cloned the repo
 pip install boto3
 aws configure --profile aria-dev   # if not done already
 python scripts/seed_units.py
@@ -790,7 +790,7 @@ python scripts/seed_units.py
 ## 10. Run the Frontend Locally
 
 ```bash
-cd /Users/bhavikmehta168/Desktop/ARIA/frontend
+cd ~/aria/frontend   # or wherever you cloned the repo
 npm install
 ```
 

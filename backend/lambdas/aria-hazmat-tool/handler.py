@@ -15,6 +15,7 @@ logger = Logger()
 metrics = Metrics()
 
 bedrock_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=os.environ["AWS_DEPLOY_REGION"])
+bedrock_runtime = boto3.client("bedrock-runtime", region_name=os.environ["AWS_DEPLOY_REGION"])
 dynamodb = boto3.resource("dynamodb", region_name=os.environ["AWS_DEPLOY_REGION"])
 apigw_mgmt = None
 
@@ -22,6 +23,10 @@ INCIDENTS_TABLE = os.environ["INCIDENTS_TABLE"]
 CONNECTIONS_TABLE = os.environ["CONNECTIONS_TABLE"]
 BEDROCK_KB_ID = os.environ.get("BEDROCK_KB_ID", "")
 WS_ENDPOINT = os.environ.get("WS_ENDPOINT", "")
+HAZMAT_MODEL_ID = os.environ.get(
+    "HAZMAT_MODEL_ID",
+    "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+)
 
 FIRE_DEFAULTS = {
     "hazard_type": "structure_fire",
@@ -42,23 +47,69 @@ HAZMAT_DEFAULTS = {
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    if event.get("messageVersion") == "1.0" and "actionGroup" in event:
+        return _handle_agent_action(event)
+    return _handle_direct(event)
+
+
+def _handle_agent_action(event: dict) -> dict:
+    """Handle Bedrock Agent action group invocation."""
+    action_group = event.get("actionGroup", "HazmatActions")
+    function = event.get("function", "assess_hazard")
+    params = {p["name"]: p["value"] for p in event.get("parameters", [])}
+
+    incident_id = params.get("incident_id", "")
+    context_so_far = params.get("context_so_far", "")
+    trigger_reason = params.get("trigger_reason", "fire_keyword_detected")
+    verifier_json = params.get("verifier_classification_json", "{}")
+    try:
+        verifier = json.loads(verifier_json)
+    except (json.JSONDecodeError, TypeError):
+        verifier = {}
+
+    logger.info("Hazmat agent action invoked", extra={"incident_id": incident_id, "function": function})
+    result = _run_hazmat(incident_id, context_so_far, trigger_reason, verifier, int(time.time() * 1000))
+
+    return {
+        "messageVersion": "1.0",
+        "response": {
+            "actionGroup": action_group,
+            "function": function,
+            "functionResponse": {
+                "responseBody": {
+                    "TEXT": {"body": json.dumps(result, default=str)}
+                }
+            },
+        },
+    }
+
+
+def _handle_direct(event: dict) -> dict:
+    """Handle direct Lambda invocation from coordinator fallback or stream processor."""
     t0 = int(time.time() * 1000)
     incident_id = event.get("incident_id", "")
     context_so_far = event.get("context_so_far", "")
     trigger_reason = event.get("trigger_reason", "fire_keyword_detected")
+    verifier = event.get("verifier_classification", {})
 
-    logger.info("Hazmat tool invoked", extra={"incident_id": incident_id, "trigger": trigger_reason})
+    logger.info("Hazmat tool invoked (direct)", extra={"incident_id": incident_id, "trigger": trigger_reason})
+    result = _run_hazmat(incident_id, context_so_far, trigger_reason, verifier, t0)
+    _push_to_dashboard(incident_id, {"type": "agent_complete", "agent": "hazmat", "result": result})
+    return result
 
-    is_hazmat = trigger_reason == "hazmat_keyword_detected" or "chemical" in context_so_far.lower()
+
+def _run_hazmat(incident_id: str, context_so_far: str, trigger_reason: str, verifier: dict, t0: int) -> dict:
+    is_hazmat = trigger_reason in ("hazmat_keyword_detected", "hazmat_updated", "verifier_hazmat_detected") \
+        or verifier.get("hazmat") \
+        or "chemical" in context_so_far.lower()
     kb_result = _retrieve_hazard_data(context_so_far, is_hazmat)
-    result = {**(_build_result(kb_result, is_hazmat)), "incident_id": incident_id}
+    interpreted = _interpret_hazard_data(kb_result, context_so_far, is_hazmat, verifier)
 
     elapsed_ms = int(time.time() * 1000) - t0
     metrics.add_metric("hazmat_agent_complete_ms", unit=MetricUnit.Milliseconds, value=elapsed_ms)
-    result["elapsed_ms"] = elapsed_ms
 
+    result = {**(_build_result(kb_result, is_hazmat)), **interpreted, "incident_id": incident_id, "elapsed_ms": elapsed_ms}
     _update_incident(incident_id, result, t0)
-    _push_to_dashboard(incident_id, {"type": "agent_complete", "agent": "hazmat", "result": result})
     return result
 
 
@@ -88,6 +139,54 @@ def _retrieve_hazard_data(context: str, is_hazmat: bool) -> dict:
     except Exception as e:
         logger.warning("KB retrieval failed, using defaults", exc_info=e)
     return {}
+
+
+def _interpret_hazard_data(kb_result: dict, context: str, is_hazmat: bool, verifier: dict) -> dict:
+    """Call Claude Haiku to produce incident-specific hazard instructions from raw KB text."""
+    kb_text = kb_result.get("content", "")
+    if not kb_text:
+        return {}
+
+    incident_kind = "chemical hazmat spill" if is_hazmat else "structure fire"
+    conditions = verifier.get("detected_conditions", [])
+    severity = verifier.get("severity", "urgent")
+
+    prompt = (
+        f"You are a hazmat/fire safety coordinator. Given the caller transcript and relevant FEMA/NIOSH "
+        f"knowledge base excerpt, provide specific responder instructions for this {incident_kind}.\n\n"
+        f"CALLER TRANSCRIPT:\n{context[:300]}\n\n"
+        f"SEVERITY: {severity}. "
+        f"{'AI-detected conditions: ' + ', '.join(conditions) + '.' if conditions else ''}\n\n"
+        f"KNOWLEDGE BASE EXCERPT:\n{kb_text[:600]}\n\n"
+        "Reply ONLY with valid JSON — no markdown:\n"
+        "{\n"
+        '  "hazard_warnings": ["specific hazard warnings for responders"],\n'
+        '  "evacuation_radius_meters": integer,\n'
+        '  "protective_equipment": ["required PPE items"],\n'
+        '  "suppression_approach": "specific approach for this incident",\n'
+        '  "priority_action": "one sentence: what responders must do first"\n'
+        "}"
+    )
+
+    try:
+        resp = bedrock_runtime.invoke_model(
+            modelId=HAZMAT_MODEL_ID,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 400,
+                "temperature": 0.1,
+                "messages": [{"role": "user", "content": prompt}],
+            }),
+            contentType="application/json",
+            accept="application/json",
+        )
+        raw = json.loads(resp["body"].read())
+        text = raw["content"][0]["text"].strip()
+        text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(text)
+    except Exception as e:
+        logger.warning("Hazard data interpretation failed — using KB defaults", exc_info=e)
+        return {}
 
 
 def _build_result(kb_result: dict, is_hazmat: bool) -> dict:

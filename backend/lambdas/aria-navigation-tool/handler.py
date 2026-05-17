@@ -31,14 +31,60 @@ UNIT_TYPE_PRIORITY = {"ambulance": 1, "fire_engine": 2, "police": 3, "hazmat": 4
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    # Route: Bedrock Agent action group invocation vs. direct Lambda call
+    if event.get("messageVersion") == "1.0" and "actionGroup" in event:
+        return _handle_agent_action(event)
+    return _handle_direct(event)
+
+
+def _handle_agent_action(event: dict) -> dict:
+    """Handle Bedrock Agent action group invocation. Returns Bedrock Agent response format."""
+    action_group = event.get("actionGroup", "NavigationActions")
+    function = event.get("function", "find_unit")
+    params = {p["name"]: p["value"] for p in event.get("parameters", [])}
+
+    incident_id = params.get("incident_id", "")
+    context_so_far = params.get("context_so_far", "")
+    trigger_reason = params.get("trigger_reason", "location_detected")
+    verifier_json = params.get("verifier_classification_json", "{}")
+    try:
+        verifier = json.loads(verifier_json)
+    except (json.JSONDecodeError, TypeError):
+        verifier = {}
+
+    logger.info("Navigation agent action invoked", extra={"incident_id": incident_id, "function": function})
+    result = _run_navigation(incident_id, context_so_far, {}, trigger_reason, verifier, int(time.time() * 1000))
+
+    return {
+        "messageVersion": "1.0",
+        "response": {
+            "actionGroup": action_group,
+            "function": function,
+            "functionResponse": {
+                "responseBody": {
+                    "TEXT": {"body": json.dumps(result, default=str)}
+                }
+            },
+        },
+    }
+
+
+def _handle_direct(event: dict) -> dict:
+    """Handle direct Lambda invocation from coordinator fallback or stream processor."""
     t0 = int(time.time() * 1000)
     incident_id = event.get("incident_id", "")
     context_so_far = event.get("context_so_far", "")
     incident_data = event.get("incident_data", {})
     trigger_reason = event.get("trigger_reason", "location_detected")
+    verifier = event.get("verifier_classification", {})
 
-    logger.info("Navigation tool invoked", extra={"incident_id": incident_id, "trigger": trigger_reason})
+    logger.info("Navigation tool invoked (direct)", extra={"incident_id": incident_id, "trigger": trigger_reason})
+    result = _run_navigation(incident_id, context_so_far, incident_data, trigger_reason, verifier, t0)
+    _push_to_dashboard(incident_id, {"type": "agent_complete", "agent": "navigation", "result": result})
+    return result
 
+
+def _run_navigation(incident_id: str, context_so_far: str, incident_data: dict, trigger_reason: str, verifier: dict, t0: int) -> dict:
     incident_location = _extract_location(context_so_far, incident_data)
     available_units = _get_available_units(trigger_reason)
     recommendations = _calculate_etas(incident_location, available_units)
@@ -49,7 +95,7 @@ def lambda_handler(event, context):
     elapsed_ms = int(time.time() * 1000) - t0
     metrics.add_metric("navigation_agent_complete_ms", unit=MetricUnit.Milliseconds, value=elapsed_ms)
 
-    result = {
+    return {
         "status": "ok",
         "incident_id": incident_id,
         "incident_location": incident_location,
@@ -57,9 +103,6 @@ def lambda_handler(event, context):
         "recommended_unit": best_unit,
         "elapsed_ms": elapsed_ms,
     }
-
-    _push_to_dashboard(incident_id, {"type": "agent_complete", "agent": "navigation", "result": result})
-    return result
 
 
 def _extract_location(context: str, incident_data: dict) -> dict:
