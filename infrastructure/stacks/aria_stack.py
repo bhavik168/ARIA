@@ -397,7 +397,7 @@ class AriaStack(Stack):
             )
 
         ingest_role = _role("ingest")
-        tables["incidents"].grant_write_data(ingest_role)
+        tables["incidents"].grant_read_write_data(ingest_role)
         buckets["bucket"].grant_write(ingest_role)
         ingest_role.add_to_policy(iam.PolicyStatement(
             actions=["transcribe:StartStreamTranscription"],
