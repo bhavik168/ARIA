@@ -45,7 +45,26 @@ def lambda_handler(event, context):
     if http_method == "POST" and path.endswith("/start"):
         return _start_session(event, context)
 
+    if http_method == "POST" and path.endswith("/presign"):
+        return _presign_upload(event)
+
     return _respond(400, {"error": "Unknown route"})
+
+
+# ─── Presign Upload ───────────────────────────────────────────────────────────
+
+def _presign_upload(event: dict) -> dict:
+    body = json.loads(event.get("body") or "{}")
+    filename = body.get("filename", "audio.wav")
+    content_type = body.get("content_type", "audio/wav")
+    audio_key = f"uploads/{uuid.uuid4()}/{filename}"
+
+    upload_url = s3_client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": ARIA_BUCKET, "Key": audio_key, "ContentType": content_type},
+        ExpiresIn=300,
+    )
+    return _respond(200, {"upload_url": upload_url, "audio_key": audio_key})
 
 
 # ─── Session Start ────────────────────────────────────────────────────────────

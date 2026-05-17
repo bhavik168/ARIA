@@ -677,6 +677,7 @@ class AriaStack(Stack):
 
         session = api.root.add_resource("session")
         session.add_resource("start").add_method("POST", _integration(functions["ingest"]))
+        session.add_resource("presign").add_method("POST", _integration(functions["ingest"]))
 
         session_id = session.add_resource("{id}")
         session_id.add_resource("approve").add_method("POST", _integration(functions["coordinator"]))
