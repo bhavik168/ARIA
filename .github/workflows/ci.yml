@@ -1,0 +1,139 @@
+name: CI / CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-west-2
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+jobs:
+  # ─── Backend Tests ────────────────────────────────────────────────
+  backend-test:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt pytest pytest-cov moto[dynamodb,s3,lambda]
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --cov=backend --cov-report=xml --cov-fail-under=70
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+  # ─── CDK Synth ────────────────────────────────────────────────────
+  cdk-synth:
+    name: CDK Synth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install CDK deps
+        run: |
+          npm install -g aws-cdk
+          pip install -r infrastructure/requirements.txt
+
+      - name: CDK Synth (no deploy — validates stack is valid CloudFormation)
+        working-directory: infrastructure
+        env:
+          AWS_ACCOUNT_ID: "000000000000"
+          AWS_REGION: us-west-2
+          CDK_DEFAULT_ACCOUNT: "000000000000"
+          CDK_DEFAULT_REGION: us-west-2
+        run: cdk synth --no-lookups
+
+  # ─── Frontend Build ───────────────────────────────────────────────
+  frontend-build:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Build
+        env:
+          VITE_API_URL: https://placeholder.execute-api.us-west-2.amazonaws.com/prod
+          VITE_WS_URL: wss://placeholder.execute-api.us-west-2.amazonaws.com/prod
+          VITE_MAPBOX_TOKEN: pk.placeholder
+        run: npm run build
+
+  # ─── Deploy (main branch only) ────────────────────────────────────
+  deploy-backend:
+    name: Deploy Backend (CDK)
+    needs: [backend-test, cdk-synth]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install CDK + deps
+        run: |
+          npm install -g aws-cdk
+          pip install -r infrastructure/requirements.txt
+
+      - name: CDK Deploy
+        working-directory: infrastructure
+        run: cdk deploy AriaStack --require-approval never --outputs-file ../cdk-outputs.json
+
+      - name: Upload CDK outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdk-outputs
+          path: cdk-outputs.json
+
+      - name: Run smoke test
+        run: |
+          pip install requests websocket-client
+          python scripts/smoke_test.py
+        env:
+          CDK_OUTPUTS_FILE: cdk-outputs.json
