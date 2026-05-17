@@ -28,6 +28,8 @@ MEDICAL_FUNCTION = os.environ.get("MEDICAL_FUNCTION", "aria-medical-tool")
 HAZMAT_FUNCTION = os.environ.get("HAZMAT_FUNCTION", "aria-hazmat-tool")
 REPORT_FUNCTION = os.environ.get("REPORT_FUNCTION", "aria-report")
 WS_ENDPOINT = os.environ.get("WS_ENDPOINT", "")
+GUARDRAIL_ID = os.environ.get("GUARDRAIL_ID", "")
+GUARDRAIL_VERSION = os.environ.get("GUARDRAIL_VERSION", "DRAFT")
 
 # Timeout budgets (seconds)
 AGENT_TIMEOUTS = {
@@ -67,6 +69,19 @@ def lambda_handler(event, context):
 
     results = _run_specialist_agents(incident_id, context_so_far, incident_data, t0)
     card = _synthesize_card(incident_id, context_so_far, results, t0)
+
+    # Guardrail check on synthesized card before surfacing to dispatcher
+    blocked, block_reason = _apply_guardrail(card)
+    if blocked:
+        logger.warning("Guardrail blocked recommendation card", extra={
+            "incident_id": incident_id, "reason": block_reason,
+        })
+        _push_to_dashboard(incident_id, {
+            "type": "guardrail_blocked",
+            "reason": block_reason,
+            "fallback": "Manual protocol required — contact supervisor",
+        })
+        return {"status": "guardrail_blocked", "reason": block_reason}
 
     _save_recommendation(incident_id, card)
     _push_to_dashboard(incident_id, {"type": "recommendation_ready", "card": card})
@@ -157,6 +172,43 @@ def _synthesize_card(incident_id: str, context: str, results: dict, t0: int) -> 
         "generated_at_ms": int(time.time() * 1000),
         "agent_results": {k: v.get("status", "ok") for k, v in results.items()},
     }
+
+
+def _apply_guardrail(card: dict) -> tuple[bool, str]:
+    """
+    Apply Bedrock guardrail to the synthesized recommendation card text.
+    Returns (blocked: bool, reason: str).
+    Skips gracefully if GUARDRAIL_ID is not configured.
+    """
+    if not GUARDRAIL_ID:
+        return False, ""
+
+    # Flatten card to text for guardrail evaluation
+    card_text = (
+        f"Incident type: {card.get('incident_type', '')}. "
+        f"Severity: {card.get('severity', '')}. "
+        f"Summary: {card.get('summary', '')}. "
+        f"Reasoning: {card.get('reasoning_summary', '')}. "
+        f"Triage: {card.get('triage_protocol', '')}."
+    )
+
+    try:
+        resp = bedrock_runtime.apply_guardrail(
+            guardrailIdentifier=GUARDRAIL_ID,
+            guardrailVersion=GUARDRAIL_VERSION,
+            source="OUTPUT",
+            content=[{"text": {"text": card_text}}],
+        )
+        action = resp.get("action", "NONE")
+        if action == "GUARDRAIL_INTERVENED":
+            outputs = resp.get("outputs", [])
+            reason = outputs[0].get("text", "policy violation") if outputs else "policy violation"
+            return True, reason
+        return False, ""
+    except Exception as e:
+        # Guardrail failure is non-fatal — log and continue
+        logger.warning("Guardrail apply_guardrail call failed — continuing without guardrail", exc_info=e)
+        return False, ""
 
 
 def _handle_approve(event: dict) -> dict:

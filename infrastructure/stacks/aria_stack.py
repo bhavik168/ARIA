@@ -1,3 +1,4 @@
+import json
 import os
 from aws_cdk import (
     Stack, Duration, RemovalPolicy, CfnOutput,
@@ -9,6 +10,8 @@ from aws_cdk import (
     aws_apigatewayv2 as apigwv2,
     aws_cloudwatch as cloudwatch,
     aws_logs as logs,
+    aws_opensearchserverless as aoss,
+    aws_bedrock as bedrock,
 )
 from constructs import Construct
 
@@ -20,12 +23,248 @@ class AriaStack(Stack):
 
         tables = self._create_dynamodb_tables()
         buckets = self._create_s3_buckets()
+        kb_id, ds_id = self._create_knowledge_base(buckets)
+        guardrail_id, guardrail_version = self._create_guardrail(buckets)
         roles = self._create_iam_roles(tables, buckets)
-        functions = self._create_lambda_functions(roles, tables, buckets)
+        functions = self._create_lambda_functions(roles, tables, buckets, kb_id, guardrail_id, guardrail_version)
         rest_api = self._create_rest_api(functions)
         ws_api = self._create_websocket_api(functions)
         self._create_cloudwatch_alarms(functions)
-        self._create_outputs(rest_api, ws_api, tables, buckets)
+        self._create_outputs(rest_api, ws_api, tables, buckets, kb_id, ds_id, guardrail_id)
+
+    # ─── Bedrock Guardrail ────────────────────────────────────────────────────
+
+    def _create_guardrail(self, buckets: dict) -> tuple:
+        guardrail = bedrock.CfnGuardrail(
+            self, "AriaGuardrail",
+            name="aria-guardrail",
+            description="ARIA safety guardrail — no autonomous dispatch, no PII leakage, no medical prescriptions",
+            blocked_inputs_messaging="Input blocked by ARIA safety policy. Contact supervisor.",
+            blocked_outputs_messaging="Output blocked by ARIA safety policy. Recommendation withheld — use manual protocol.",
+
+            # Content filters: block violence/hate in outputs
+            content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
+                filters_config=[
+                    bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                        type="HATE", input_strength="MEDIUM", output_strength="HIGH",
+                    ),
+                    bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                        type="VIOLENCE", input_strength="MEDIUM", output_strength="HIGH",
+                    ),
+                    bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                        type="MISCONDUCT", input_strength="MEDIUM", output_strength="HIGH",
+                    ),
+                ],
+            ),
+
+            # PII: block phone numbers and SSNs from appearing in agent outputs
+            sensitive_information_policy_config=bedrock.CfnGuardrail.SensitiveInformationPolicyConfigProperty(
+                pii_entities_config=[
+                    bedrock.CfnGuardrail.PiiEntityConfigProperty(type="PHONE", action="BLOCK"),
+                    bedrock.CfnGuardrail.PiiEntityConfigProperty(type="US_SOCIAL_SECURITY_NUMBER", action="BLOCK"),
+                    bedrock.CfnGuardrail.PiiEntityConfigProperty(type="EMAIL", action="ANONYMIZE"),
+                    bedrock.CfnGuardrail.PiiEntityConfigProperty(type="NAME", action="ANONYMIZE"),
+                ],
+                regexes_config=[
+                    # Block specific drug dosage patterns (mg, mL, units)
+                    bedrock.CfnGuardrail.RegexConfigProperty(
+                        name="drug-dosage",
+                        description="Specific drug dosages (e.g. 5mg morphine, 1:1000 epi)",
+                        pattern=r"\b\d+(\.\d+)?\s*(mg|mL|mcg|units?|IU)\s+of\s+\w+",
+                        action="BLOCK",
+                    ),
+                ],
+            ),
+
+            # Topic denials: autonomous dispatch, prescriptions, self-harm escalation
+            topic_policy_config=bedrock.CfnGuardrail.TopicPolicyConfigProperty(
+                topics_config=[
+                    bedrock.CfnGuardrail.TopicConfigProperty(
+                        name="autonomous-dispatch",
+                        definition=(
+                            "Any instruction or claim to automatically dispatch, route, or assign "
+                            "emergency units without explicit human dispatcher approval"
+                        ),
+                        examples=[
+                            "Dispatching unit MED-1 automatically",
+                            "Unit has been sent without approval",
+                            "Route assigned — no approval needed",
+                        ],
+                        type="DENY",
+                    ),
+                    bedrock.CfnGuardrail.TopicConfigProperty(
+                        name="medical-prescription",
+                        definition=(
+                            "Specific drug dosages, medication prescriptions, IV orders, or clinical "
+                            "treatment protocols that must only come from licensed medical professionals"
+                        ),
+                        examples=[
+                            "Administer 5mg morphine IV",
+                            "Give patient 325mg aspirin",
+                            "Push 1mg epinephrine 1:10000",
+                        ],
+                        type="DENY",
+                    ),
+                    bedrock.CfnGuardrail.TopicConfigProperty(
+                        name="self-harm-crisis",
+                        definition=(
+                            "Suicidal ideation, active self-harm, hostage situations, or imminent "
+                            "violence against self — these require immediate human escalation"
+                        ),
+                        examples=[
+                            "caller says they want to kill themselves",
+                            "hostage situation in progress",
+                            "caller is threatening self-harm with a weapon",
+                        ],
+                        type="DENY",
+                    ),
+                ],
+            ),
+        )
+
+        # Version for pinning (DRAFT always exists)
+        CfnOutput(self, "GuardrailId", value=guardrail.attr_guardrail_id, export_name="AriaGuardrailId")
+        return guardrail.attr_guardrail_id, "DRAFT"
+
+    # ─── Bedrock Knowledge Base + OpenSearch Serverless ──────────────────────
+
+    def _create_knowledge_base(self, buckets: dict) -> tuple:
+        collection_name = "aria-kb"
+
+        # Encryption policy (AWS-managed key)
+        enc_policy = aoss.CfnSecurityPolicy(
+            self, "AOSSEncryptionPolicy",
+            name="aria-kb-enc",
+            type="encryption",
+            policy=json.dumps({
+                "Rules": [{"Resource": [f"collection/{collection_name}"], "ResourceType": "collection"}],
+                "AWSOwnedKey": True,
+            }),
+        )
+
+        # Network policy (public access — VPC endpoint can be added later)
+        net_policy = aoss.CfnSecurityPolicy(
+            self, "AOSSNetworkPolicy",
+            name="aria-kb-net",
+            type="network",
+            policy=json.dumps([{
+                "Rules": [
+                    {"Resource": [f"collection/{collection_name}"], "ResourceType": "collection"},
+                    {"Resource": [f"collection/{collection_name}"], "ResourceType": "dashboard"},
+                ],
+                "AllowFromPublic": True,
+            }]),
+        )
+
+        # AOSS collection
+        collection = aoss.CfnCollection(
+            self, "AOSSCollection",
+            name=collection_name,
+            type="VECTORSEARCH",
+        )
+        collection.add_dependency(enc_policy)
+        collection.add_dependency(net_policy)
+
+        # IAM role for Bedrock KB service
+        kb_role = iam.Role(
+            self, "BedrockKBRole",
+            role_name="aria-bedrock-kb-role",
+            assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
+        )
+        buckets["bucket"].grant_read(kb_role)
+        kb_role.add_to_policy(iam.PolicyStatement(
+            actions=["aoss:APIAccessAll"],
+            resources=[f"arn:aws:aoss:{self.region}:{self.account}:collection/*"],
+        ))
+
+        # AOSS data access policy — grants KB role and account root access to index
+        aoss.CfnAccessPolicy(
+            self, "AOSSAccessPolicy",
+            name="aria-kb-access",
+            type="data",
+            policy=json.dumps([{
+                "Rules": [
+                    {
+                        "Resource": [f"collection/{collection_name}"],
+                        "Permission": [
+                            "aoss:CreateCollectionItems",
+                            "aoss:DeleteCollectionItems",
+                            "aoss:UpdateCollectionItems",
+                            "aoss:DescribeCollectionItems",
+                        ],
+                        "ResourceType": "collection",
+                    },
+                    {
+                        "Resource": [f"index/{collection_name}/*"],
+                        "Permission": [
+                            "aoss:CreateIndex",
+                            "aoss:DeleteIndex",
+                            "aoss:UpdateIndex",
+                            "aoss:DescribeIndex",
+                            "aoss:ReadDocument",
+                            "aoss:WriteDocument",
+                        ],
+                        "ResourceType": "index",
+                    },
+                ],
+                "Principal": [
+                    kb_role.role_arn,
+                    f"arn:aws:iam::{self.account}:root",
+                ],
+            }]),
+        )
+
+        # Bedrock Knowledge Base
+        kb = bedrock.CfnKnowledgeBase(
+            self, "AriaKnowledgeBase",
+            name="aria-knowledge-base",
+            description="ARIA dispatcher knowledge base — Seattle / King County protocols",
+            role_arn=kb_role.role_arn,
+            knowledge_base_configuration=bedrock.CfnKnowledgeBase.KnowledgeBaseConfigurationProperty(
+                type="VECTOR",
+                vector_knowledge_base_configuration=bedrock.CfnKnowledgeBase.VectorKnowledgeBaseConfigurationProperty(
+                    embedding_model_arn=f"arn:aws:bedrock:{self.region}::foundation-model/amazon.titan-embed-text-v2:0",
+                ),
+            ),
+            storage_configuration=bedrock.CfnKnowledgeBase.StorageConfigurationProperty(
+                type="OPENSEARCH_SERVERLESS",
+                opensearch_serverless_configuration=bedrock.CfnKnowledgeBase.OpenSearchServerlessConfigurationProperty(
+                    collection_arn=collection.attr_arn,
+                    vector_index_name="aria-kb-index",
+                    field_mapping=bedrock.CfnKnowledgeBase.OpenSearchServerlessFieldMappingProperty(
+                        vector_field="bedrock-knowledge-base-default-vector",
+                        text_field="AMAZON_BEDROCK_TEXT_CHUNK",
+                        metadata_field="AMAZON_BEDROCK_METADATA",
+                    ),
+                ),
+            ),
+        )
+        kb.add_dependency(collection)
+
+        # S3 data source pointing at knowledge-base/ prefix
+        ds = bedrock.CfnDataSource(
+            self, "AriaKBDataSource",
+            knowledge_base_id=kb.attr_knowledge_base_id,
+            name="aria-s3-source",
+            data_source_configuration=bedrock.CfnDataSource.DataSourceConfigurationProperty(
+                type="S3",
+                s3_configuration=bedrock.CfnDataSource.S3DataSourceConfigurationProperty(
+                    bucket_arn=buckets["bucket"].bucket_arn,
+                    inclusion_prefixes=["knowledge-base/"],
+                ),
+            ),
+            vector_ingestion_configuration=bedrock.CfnDataSource.VectorIngestionConfigurationProperty(
+                chunking_configuration=bedrock.CfnDataSource.ChunkingConfigurationProperty(
+                    chunking_strategy="FIXED_SIZE",
+                    fixed_size_chunking_configuration=bedrock.CfnDataSource.FixedSizeChunkingConfigurationProperty(
+                        max_tokens=512,
+                        overlap_percentage=10,
+                    ),
+                ),
+            ),
+        )
+
+        return kb.attr_knowledge_base_id, ds.attr_data_source_id
 
     # ─── DynamoDB ────────────────────────────────────────────────────────────
 
@@ -289,7 +528,7 @@ class AriaStack(Stack):
 
     # ─── Lambda Functions ────────────────────────────────────────────────────
 
-    def _create_lambda_functions(self, roles: dict, tables: dict, buckets: dict) -> dict:
+    def _create_lambda_functions(self, roles: dict, tables: dict, buckets: dict, kb_id: str, guardrail_id: str, guardrail_version: str) -> dict:
         bucket_name = buckets["bucket"].bucket_name
         common_env = {
             "AWS_DEPLOY_REGION": self.region,
@@ -352,6 +591,8 @@ class AriaStack(Stack):
                 "MEDICAL_FUNCTION": "aria-medical-tool",
                 "HAZMAT_FUNCTION": "aria-hazmat-tool",
                 "REPORT_FUNCTION": "aria-report",
+                "GUARDRAIL_ID": guardrail_id,
+                "GUARDRAIL_VERSION": guardrail_version,
             },
             memory=1024, timeout=300)
 
@@ -361,11 +602,11 @@ class AriaStack(Stack):
         medical = _fn("Medical", "aria-medical-tool", roles["medical"],
             extra_env={
                 "MOCK_HOSPITAL_FUNCTION": "aria-mock-hospital",
-                "BEDROCK_KB_ID": "REPLACE_ME",
+                "BEDROCK_KB_ID": kb_id,
             })
 
         hazmat = _fn("Hazmat", "aria-hazmat-tool", roles["hazmat"],
-            extra_env={"BEDROCK_KB_ID": "REPLACE_ME"})
+            extra_env={"BEDROCK_KB_ID": kb_id})
 
         mock_hospital = _fn("MockHospital", "aria-mock-hospital", roles["mock_hospital"])
 
@@ -524,10 +765,12 @@ class AriaStack(Stack):
 
     # ─── Outputs ─────────────────────────────────────────────────────────────
 
-    def _create_outputs(self, rest_api, ws_api, tables, buckets) -> None:
+    def _create_outputs(self, rest_api, ws_api, tables, buckets, kb_id, ds_id, guardrail_id) -> None:
         CfnOutput(self, "RestApiUrl", value=rest_api.url, export_name="AriaRestApiUrl")
         CfnOutput(self, "WebSocketUrl",
             value=f"wss://{ws_api.ref}.execute-api.{self.region}.amazonaws.com/prod",
             export_name="AriaWebSocketUrl")
         CfnOutput(self, "IncidentsTableName", value=tables["incidents"].table_name)
         CfnOutput(self, "AriaBucketName", value=buckets["bucket"].bucket_name)
+        CfnOutput(self, "BedrockKBId", value=kb_id, export_name="AriaBedrockKBId")
+        CfnOutput(self, "BedrockDataSourceId", value=ds_id, export_name="AriaBedrockDataSourceId")
