@@ -54,10 +54,14 @@ export default function App() {
   const [incidentId, setIncidentId]       = useState<string | null>(null);
   const [uploadState, setUploadState]     = useState<UploadState>("idle");
   const [audioFileName, setAudioFileName] = useState<string | null>(null);
+  const [audioObjectUrl, setAudioObjectUrl] = useState<string | null>(null);
+  const [pendingAudioKey, setPendingAudioKey] = useState<string | null>(null);
+  const [pipelineStarted, setPipelineStarted] = useState(false);
 
   // WebSocket + polling refs
   const wsRef   = useRef<WebSocket | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sessionStartEpochRef = useRef<number>(0);
 
   // ---- Simulation clock ----
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -77,6 +81,8 @@ export default function App() {
   const [hazData,         setHazData]         = useState<HazData | null>(null);
   const [confidence,      setConfidence]      = useState(0);
   const [reasoning,       setReasoning]       = useState("");
+  const [recSummary,      setRecSummary]      = useState<string | null>(null);
+  const [recAddress,      setRecAddress]      = useState<string | null>(null);
   const [partialApproved, setPartialApproved] = useState(false);
   const [fullyApproved,   setFullyApproved]   = useState(false);
   const [units,           setUnits]           = useState<Unit[]>([]);
@@ -127,8 +133,14 @@ export default function App() {
     setIncidentId(null);
     setUploadState("idle");
     setAudioFileName(null);
+    setAudioObjectUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+    setPendingAudioKey(null);
+    setPipelineStarted(false);
     setSessionComplete(false);
     setReportUrl(null);
+    setRecSummary(null);
+    setRecAddress(null);
+    sessionStartEpochRef.current = 0;
     wordPulses.current = [];
   }, []);
 
@@ -152,10 +164,21 @@ export default function App() {
       case "transcript":
         setTranscript((prev) => [
           ...prev,
-          { t: ev.t ?? 0, speaker: ev.speaker, text: ev.text, kw: ev.kw ?? null },
+          { t: ev.t, speaker: ev.speaker, text: ev.text, kw: ev.kw ?? null },
         ]);
         wordPulses.current.push({ at: performance.now(), idx: Math.floor(Math.random() * 56) });
         break;
+      case "transcript_word": {
+        const relSec = sessionStartEpochRef.current
+          ? (ev.timestamp_ms - sessionStartEpochRef.current) / 1000
+          : 0;
+        setTranscript((prev) => [
+          ...prev,
+          { t: Math.max(0, relSec), speaker: ev.speaker.toUpperCase(), text: ev.word, kw: null },
+        ]);
+        wordPulses.current.push({ at: performance.now(), idx: Math.floor(Math.random() * 56) });
+        break;
+      }
       case "timeline":
         setTimeline((prev) => [...prev, { t: ev.t ?? 0, icon: ev.icon, label: ev.label }]);
         break;
@@ -191,6 +214,65 @@ export default function App() {
         }
         break;
       }
+      case "agent_started":
+        setAgentStates((prev) => ({ ...prev, [ev.agent]: "running" }));
+        setTimeline((prev) => [...prev, { t: 0, icon: "⚡", label: `${ev.agent} agent started` }]);
+        break;
+
+      case "agent_complete": {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const res = (ev as any).result || {};
+        const ag: string = (ev as any).agent ?? "";
+        setAgentStates((prev) => ({ ...prev, [ag]: "complete" }));
+        if (ag === "navigation") {
+          // Address update is independent of whether a unit was found
+          const loc = res.incident_location as { address?: string } | string | undefined;
+          if (loc) setRecAddress(typeof loc === "string" ? loc : (loc.address ?? ""));
+          if (res.recommended_unit || res.unit_id) {
+            const u = res.recommended_unit ?? res;
+            setNavData({
+              unit:      u.unit_id      ?? res.unit_id ?? "",
+              unit_type: u.unit_type    ?? "",
+              eta_min:   u.eta_min      ?? res.eta_min ?? 0,
+              station:   u.station      ?? "",
+              elapsed:   res.elapsed_ms != null ? `${(res.elapsed_ms / 1000).toFixed(1)}s` : "",
+            } as NavData);
+          }
+        }
+        if (ag === "medical" && (res.recommended_hospital || res.hospital_name)) {
+          const h = res.recommended_hospital ?? res;
+          setMedData({
+            hospital:  h.hospital_name ?? h.name ?? res.hospital_name ?? "",
+            eta_min:   h.eta_min       ?? res.eta_min ?? 0,
+            status:    h.status        ?? "",
+            bay:       h.bay           ?? "",
+            protocol:  res.triage_protocol ?? res.protocol_text ?? "",
+            elapsed:   res.elapsed_ms != null ? `${(res.elapsed_ms / 1000).toFixed(1)}s` : "",
+          } as MedData);
+        }
+        if (ag === "hazmat" && (res.hazard_warnings || res.evacuation_radius_m)) {
+          setHazData({
+            summary:             res.summary             ?? "",
+            evacuation_radius_m: res.evacuation_radius_m ?? undefined,
+            gear:                res.gear                ?? undefined,
+          } as HazData);
+        }
+        break;
+      }
+
+      case "recommendation_ready": {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const card = (ev as any).card ?? {};
+        if (card.summary)           setRecSummary(card.summary);
+        if (card.reasoning_summary) setReasoning(card.reasoning_summary);
+        const conf = card.ai_confidence === "high" ? 0.88
+                   : card.ai_confidence === "medium" ? 0.62 : 0.38;
+        animateConfidence(conf);
+        setAgentStates((prev) => ({ ...prev, coordinator: "complete" }));
+        setTimeline((prev) => [...prev, { t: 0, icon: "✓", label: "Recommendation card ready" }]);
+        break;
+      }
+
       case "partial_approval":
         // handled via rec_ready / approved events
         break;
@@ -269,6 +351,12 @@ export default function App() {
 
     ws.onopen = () => {
       setTimeline((prev) => [...prev, { t: 0, icon: "●", label: "WebSocket connected" }]);
+      // Keepalive: API GW WebSocket idles out; ping every 20s to hold the connection.
+      const ping = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action: "ping" }));
+        else clearInterval(ping);
+      }, 20000);
+      ws.addEventListener("close", () => clearInterval(ping));
     };
 
     ws.onmessage = (msg) => {
@@ -337,6 +425,7 @@ export default function App() {
       };
 
       reset();
+      sessionStartEpochRef.current = Date.now();
       setIncidentId(incident_id);
       setSessionActive(true);
       setPlaying(true);
@@ -349,14 +438,16 @@ export default function App() {
   }, [reset, openWebSocket]);
 
   // =========================================================================
-  // SESSION START — REAL AUDIO (file upload → S3 → Transcribe → WebSocket)
+  // SESSION START — REAL AUDIO (file upload → S3, pipeline deferred to Play)
   // =========================================================================
   const startAudioSession = useCallback(async (audioFile: File) => {
     if (!API_BASE || !WS_BASE) {
       showToast("VITE_API_BASE_URL / VITE_WS_URL not configured in .env", "urgent");
       return;
     }
+    reset();
     setAudioFileName(audioFile.name);
+    setAudioObjectUrl(URL.createObjectURL(audioFile));
     setUploadState("uploading");
     try {
       // 1. Get pre-signed S3 upload URL
@@ -382,33 +473,42 @@ export default function App() {
       });
       if (!uploadRes.ok) throw new Error(`S3 upload failed: HTTP ${uploadRes.status}`);
 
-      setUploadState("processing");
+      // 3. File is ready — show the dashboard in standby. Pipeline fires on Play.
+      setPendingAudioKey(audio_key);
+      setAudioFileName(audioFile.name);
+      setSessionActive(true);
+      setUploadState("idle");
+    } catch (err) {
+      setUploadState("error");
+      showToast(`Upload failed: ${(err as Error).message}`, "urgent");
+    }
+  }, [reset, openWebSocket]);
 
-      // 3. Start session with the uploaded file key
+  // =========================================================================
+  // PIPELINE TRIGGER — fires POST /session/start on first Play press
+  // =========================================================================
+  const startPipeline = useCallback(async (audioKey: string) => {
+    try {
       const startRes = await fetch(`${API_BASE}/session/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio_file_key: audio_key }),
+        body: JSON.stringify({ audio_file_key: audioKey }),
       });
       if (!startRes.ok) throw new Error(`Session start failed: HTTP ${startRes.status}`);
       const { incident_id, websocket_url } = await startRes.json() as {
         incident_id: string;
         websocket_url: string;
       };
-
-      // 4. Activate session and open WebSocket
-      reset();
+      sessionStartEpochRef.current = Date.now();
       setIncidentId(incident_id);
-      setAudioFileName(audioFile.name);
-      setSessionActive(true);
-      setPlaying(true);
+      setPipelineStarted(true);
+      setPendingAudioKey(null);
       startedAtRef.current = performance.now();
       openWebSocket(incident_id, websocket_url);
     } catch (err) {
-      setUploadState("error");
-      showToast(`Audio session failed: ${(err as Error).message}`, "urgent");
+      showToast(`Pipeline start failed: ${(err as Error).message}`, "urgent");
     }
-  }, [reset, openWebSocket]);
+  }, [openWebSocket]);
 
   // =========================================================================
   // SIMULATION CLOCK (demo mode only)
@@ -450,7 +550,7 @@ export default function App() {
     }
     while (
       eventCursorRef.current < EVENTS.length &&
-      EVENTS[eventCursorRef.current].t <= t
+      (EVENTS[eventCursorRef.current] as { t: number }).t <= t
     ) {
       handleEvent(EVENTS[eventCursorRef.current]);
       eventCursorRef.current++;
@@ -485,10 +585,14 @@ export default function App() {
       elapsedAtPauseRef.current += performance.now() - startedAtRef.current;
       setPlaying(false);
     } else {
+      // First play press in real-audio mode: fire the pipeline
+      if (!IS_DEMO && !pipelineStarted && pendingAudioKey) {
+        startPipeline(pendingAudioKey);
+      }
       startedAtRef.current = performance.now();
       setPlaying(true);
     }
-  }, [playing]);
+  }, [playing, pipelineStarted, pendingAudioKey, startPipeline]);
 
   const onStop = useCallback(() => reset(), [reset]);
 
@@ -636,11 +740,12 @@ export default function App() {
           playing={playing}
           onTogglePlay={togglePlay}
           onStop={onStop}
-          elapsedMs={Math.min(elapsedMs, 163000)}
-          totalMs={163000}
+          elapsedMs={Math.min(elapsedMs, audioObjectUrl ? 163000 : SCENARIO_DURATION * 1000)}
+          totalMs={audioObjectUrl ? 163000 : SCENARIO_DURATION * 1000}
           wordPulses={wordPulses}
           demoMode={IS_DEMO}
           audioFileName={audioFileName}
+          audioObjectUrl={audioObjectUrl}
         />
         <TranscriptFeed entries={transcript} live={playing} />
       </div>
@@ -667,8 +772,8 @@ export default function App() {
         )}
         <RecCard
           severity="critical"
-          summary="Cardiac arrest — male, ~50s"
-          address="1420 East Pike Street, Capitol Hill, Seattle WA"
+          summary={recSummary ?? "Awaiting incident analysis…"}
+          address={recAddress ?? "Locating incident…"}
           recState={recState}
           navData={navData}
           medData={medData}

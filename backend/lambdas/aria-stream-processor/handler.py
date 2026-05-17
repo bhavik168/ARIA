@@ -37,7 +37,10 @@ LOCATION_PATTERNS = [
     re.compile(r'\b\d+\s+\w+\s+(Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Drive|Dr|Lane|Ln)\b', re.I),
     re.compile(r'\b(corner|intersection)\s+of\b', re.I),
     re.compile(r'\b\d{5}\b'),
-    re.compile(r'\b(north|south|east|west)\b.*\b(street|avenue|road|drive)\b', re.I),
+    re.compile(r'\b(north|south|east|west)bound\b', re.I),
+    re.compile(r'\b(north|south|east|west)\b.{0,50}\b(street|avenue|road|drive|highway|freeway|exit|mile)\b', re.I),
+    re.compile(r'\bI-\d{1,3}\b|\binterstate\s+\d+\b', re.I),
+    re.compile(r'\b(exit|offramp|on.ramp|overpass|interchange|mile marker|milepost)\b', re.I),
 ]
 
 MEDICAL_KEYWORDS = frozenset({
@@ -45,6 +48,14 @@ MEDICAL_KEYWORDS = frozenset({
     "bleeding", "overdose", "seizure", "choking", "collapsed",
     "unresponsive", "cardiac arrest", "stroke", "not responding",
     "passed out", "can't breathe", "difficulty breathing",
+    # Natural-language variants common in 911 calls
+    "trouble breathing", "hard to breathe", "can't move", "unable to move",
+    "not moving", "trapped", "pinned", "crushed", "severely injured",
+    "in pain", "extreme pain", "yelling in pain", "screaming in pain",
+    "broken", "fracture", "head injury", "spinal", "neck injury",
+    "throat burning", "eyes burning", "skin burning", "chemical burn",
+    "smoke inhalation", "can't walk", "can't feel", "legs are",
+    "conscious", "still breathing", "barely breathing",
 })
 
 FIRE_KEYWORDS = frozenset({
@@ -72,10 +83,14 @@ _context_buffer: dict[str, str] = {}
 _watcher_fired: dict[str, set] = {}  # incident_id → set of fired watcher names
 _word_count: dict[str, int] = {}
 _word_count_at_fire: dict[str, dict[str, int]] = {}  # incident_id → {watcher: word_count when last fired}
+_coordinator_fired: dict[str, int] = {}  # incident_id → word_count when coordinator was last triggered
 
 # Watchers re-fire if this many new words arrive after the previous fire and conditions still match.
-# This surfaces new information (e.g., a second injury, an escalating hazmat situation) to agents.
 REFIRE_THRESHOLD = 40
+# Coordinator fires proactively after this many words so it can synthesize even if individual
+# watchers haven't all triggered (e.g., vague location phrasing, unusual keyword variants).
+COORDINATOR_FIRST_TRIGGER = 25
+COORDINATOR_REFIRE_INTERVAL = 60
 
 
 def _should_refire(incident_id: str, watcher: str, current_count: int) -> bool:
@@ -93,6 +108,20 @@ def lambda_handler(event, context):
     word = event.get("word", "")
     speaker = event.get("speaker_label", "caller")
     timestamp_ms = event.get("timestamp_ms", int(time.time() * 1000))
+
+    if event.get("action") == "checkpoint":
+        context = event.get("context", "")
+        ts = event.get("checkpoint_at_ms", int(time.time() * 1000))
+        if incident_id and context:
+            try:
+                dynamodb.Table(INCIDENTS_TABLE).update_item(
+                    Key={"incident_id": incident_id, "timestamp": "latest"},
+                    UpdateExpression="SET context_checkpoint = :ctx, checkpoint_at_ms = :ts",
+                    ExpressionAttributeValues={":ctx": context, ":ts": ts},
+                )
+            except Exception:
+                pass
+        return {"status": "checkpoint_ok"}
 
     if not incident_id or not word:
         return {"status": "skipped"}
@@ -158,6 +187,11 @@ def lambda_handler(event, context):
             _record_fire(incident_id, "fire", current_count)
             logger.info("FireWatcher fired", extra={"incident_id": incident_id})
             _fire_agent(HAZMAT_FUNCTION, incident_id, context_so_far, "fire_keyword_detected", timestamp_ms)
+            # Fire navigation co-trigger — fire incidents always have a location
+            if "location" not in fired:
+                fired.add("location")
+                _record_fire(incident_id, "location", current_count)
+                _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "fire_collocated", timestamp_ms)
         elif _should_refire(incident_id, "fire", current_count):
             _record_fire(incident_id, "fire", current_count)
             logger.info("FireWatcher re-fired (new context)", extra={"incident_id": incident_id})
@@ -169,6 +203,15 @@ def lambda_handler(event, context):
             _record_fire(incident_id, "hazmat", current_count)
             logger.info("HazmatWatcher fired", extra={"incident_id": incident_id})
             _fire_agent(HAZMAT_FUNCTION, incident_id, context_so_far, "hazmat_keyword_detected", timestamp_ms)
+            # Hazmat incidents always have a location and medical component — co-fire both
+            if "location" not in fired:
+                fired.add("location")
+                _record_fire(incident_id, "location", current_count)
+                _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "hazmat_collocated", timestamp_ms)
+            if "medical" not in fired:
+                fired.add("medical")
+                _record_fire(incident_id, "medical", current_count)
+                _fire_agent(MEDICAL_FUNCTION, incident_id, context_so_far, "hazmat_collocated_medical", timestamp_ms)
         elif _should_refire(incident_id, "hazmat", current_count):
             _record_fire(incident_id, "hazmat", current_count)
             logger.info("HazmatWatcher re-fired (new context)", extra={"incident_id": incident_id})
@@ -184,6 +227,16 @@ def lambda_handler(event, context):
             _record_fire(incident_id, "crime", current_count)
             logger.info("CrimeWatcher re-fired (new context)", extra={"incident_id": incident_id})
             _fire_agent(NAVIGATION_FUNCTION, incident_id, context_so_far, "crime_updated", timestamp_ms)
+
+    # Proactive coordinator trigger — fires after COORDINATOR_FIRST_TRIGGER words and every
+    # COORDINATOR_REFIRE_INTERVAL words thereafter. This ensures the coordinator runs and
+    # can use Claude to extract location/classify incident even when regex watchers don't fire.
+    if current_count >= COORDINATOR_FIRST_TRIGGER:
+        last_coord = _coordinator_fired.get(incident_id, 0)
+        if last_coord == 0 or (current_count - last_coord) >= COORDINATOR_REFIRE_INTERVAL:
+            _coordinator_fired[incident_id] = current_count
+            logger.info("Coordinator proactive trigger", extra={"incident_id": incident_id, "word_count": current_count})
+            _fire_agent(COORDINATOR_FUNCTION, incident_id, context_so_far, "word_count_trigger", timestamp_ms)
 
     return {"status": "ok", "word": word, "watchers_fired": list(fired)}
 
@@ -257,26 +310,27 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
     global apigw_mgmt
     if not WS_ENDPOINT:
         return
-    if apigw_mgmt is None:
-        endpoint = WS_ENDPOINT.replace("wss://", "https://")
-        apigw_mgmt = boto3.client(
-            "apigatewaymanagementapi",
-            endpoint_url=endpoint,
-            region_name=os.environ["AWS_DEPLOY_REGION"],
-        )
-
-    conn_table = dynamodb.Table(CONNECTIONS_TABLE)
-    conns = conn_table.query(
-        IndexName="incident-index",
-        KeyConditionExpression="incident_id = :iid",
-        ExpressionAttributeValues={":iid": incident_id},
-    ).get("Items", [])
-
-    data = json.dumps(payload).encode()
-    for conn in conns:
-        try:
-            apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
-        except apigw_mgmt.exceptions.GoneException:
-            conn_table.delete_item(Key={"connection_id": conn["connection_id"]})
-        except Exception as e:
-            logger.warning("Failed to push to connection", exc_info=e)
+    try:
+        if apigw_mgmt is None:
+            endpoint = WS_ENDPOINT.replace("wss://", "https://")
+            apigw_mgmt = boto3.client(
+                "apigatewaymanagementapi",
+                endpoint_url=endpoint,
+                region_name=os.environ["AWS_DEPLOY_REGION"],
+            )
+        conn_table = dynamodb.Table(CONNECTIONS_TABLE)
+        conns = conn_table.query(
+            IndexName="incident-index",
+            KeyConditionExpression="incident_id = :iid",
+            ExpressionAttributeValues={":iid": incident_id},
+        ).get("Items", [])
+        data = json.dumps(payload).encode()
+        for conn in conns:
+            try:
+                apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+            except apigw_mgmt.exceptions.GoneException:
+                conn_table.delete_item(Key={"connection_id": conn["connection_id"]})
+            except Exception as e:
+                logger.warning("Failed to push to connection", exc_info=e)
+    except Exception as e:
+        logger.warning("_push_to_dashboard failed (non-fatal)", exc_info=e)

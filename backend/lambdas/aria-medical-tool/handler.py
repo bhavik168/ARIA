@@ -10,6 +10,7 @@ import os
 import re
 import time
 import boto3
+from decimal import Decimal
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
 
@@ -29,7 +30,7 @@ BEDROCK_KB_ID = os.environ.get("BEDROCK_KB_ID", "")
 MOCK_HOSPITAL_FUNCTION = os.environ.get("MOCK_HOSPITAL_FUNCTION", "aria-mock-hospital")
 MEDICAL_MODEL_ID = os.environ.get(
     "MEDICAL_MODEL_ID",
-    "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
 )
 WS_ENDPOINT = os.environ.get("WS_ENDPOINT", "")
 
@@ -185,23 +186,29 @@ def _interpret_protocol(kb_text: str, context: str, verifier: dict) -> str:
         "No headers, no markdown."
     )
 
-    try:
-        resp = bedrock_runtime.invoke_model(
-            modelId=MEDICAL_MODEL_ID,
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 300,
-                "temperature": 0.1,
-                "messages": [{"role": "user", "content": prompt}],
-            }),
-            contentType="application/json",
-            accept="application/json",
-        )
-        raw = json.loads(resp["body"].read())
-        return raw["content"][0]["text"].strip()
-    except Exception as e:
-        logger.warning("Protocol interpretation failed — using raw KB text", exc_info=e)
-        return kb_text[:500]
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 300,
+        "temperature": 0.1,
+        "messages": [{"role": "user", "content": prompt}],
+    })
+    for attempt in range(3):
+        try:
+            resp = bedrock_runtime.invoke_model(
+                modelId=MEDICAL_MODEL_ID,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+            raw = json.loads(resp["body"].read())
+            return raw["content"][0]["text"].strip()
+        except Exception as e:
+            if "ThrottlingException" in type(e).__name__ and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            logger.warning("Protocol interpretation failed — using raw KB text", exc_info=e)
+            return kb_text[:500]
+    return kb_text[:500]
 
 
 def _find_closest_hospital(incident_data: dict, detected_name: str | None) -> dict:
@@ -255,12 +262,23 @@ def _send_pre_alert(hospital: dict, incident_data: dict) -> dict:
         return {"status": "pending", "notes": "Pre-alert delivery pending"}
 
 
+def _to_dynamo(obj):
+    """Recursively convert float → Decimal for DynamoDB compatibility."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _to_dynamo(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_dynamo(v) for v in obj]
+    return obj
+
+
 def _update_incident(incident_id: str, result: dict, t0: int) -> None:
     table = dynamodb.Table(INCIDENTS_TABLE)
     table.update_item(
         Key={"incident_id": incident_id, "timestamp": "latest"},
         UpdateExpression="SET medical_result = :m, medical_at_ms = :ts",
-        ExpressionAttributeValues={":m": result, ":ts": t0},
+        ExpressionAttributeValues={":m": _to_dynamo(result), ":ts": t0},
     )
 
 
@@ -268,25 +286,28 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
     global apigw_mgmt
     if not WS_ENDPOINT:
         return
-    if apigw_mgmt is None:
-        endpoint = WS_ENDPOINT.replace("wss://", "https://")
-        apigw_mgmt = boto3.client(
-            "apigatewaymanagementapi",
-            endpoint_url=endpoint,
-            region_name=os.environ["AWS_DEPLOY_REGION"],
-        )
-    conn_table = dynamodb.Table(CONNECTIONS_TABLE)
-    conns = conn_table.query(
-        IndexName="incident-index",
-        KeyConditionExpression="incident_id = :iid",
-        ExpressionAttributeValues={":iid": incident_id},
-    ).get("Items", [])
-    data = json.dumps(payload).encode()
-    for conn in conns:
-        try:
-            apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
-        except Exception:
-            pass
+    try:
+        if apigw_mgmt is None:
+            endpoint = WS_ENDPOINT.replace("wss://", "https://")
+            apigw_mgmt = boto3.client(
+                "apigatewaymanagementapi",
+                endpoint_url=endpoint,
+                region_name=os.environ["AWS_DEPLOY_REGION"],
+            )
+        conn_table = dynamodb.Table(CONNECTIONS_TABLE)
+        conns = conn_table.query(
+            IndexName="incident-index",
+            KeyConditionExpression="incident_id = :iid",
+            ExpressionAttributeValues={":iid": incident_id},
+        ).get("Items", [])
+        data = json.dumps(payload).encode()
+        for conn in conns:
+            try:
+                apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("_push_to_dashboard failed (non-fatal)", exc_info=e)
 
 
 def _iso_ts() -> str:

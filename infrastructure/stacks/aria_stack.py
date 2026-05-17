@@ -365,6 +365,23 @@ class AriaStack(Stack):
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
             removal_policy=RemovalPolicy.RETAIN,
+            cors=[
+                s3.CorsRule(
+                    allowed_methods=[
+                        s3.HttpMethods.PUT,
+                        s3.HttpMethods.GET,
+                        s3.HttpMethods.HEAD,
+                    ],
+                    allowed_origins=[
+                        "http://localhost:5173",
+                        "http://localhost:3000",
+                        "https://*.cloudfront.net",
+                    ],
+                    allowed_headers=["*"],
+                    exposed_headers=["ETag"],
+                    max_age=3000,
+                )
+            ],
         )
 
         # One bucket, four folder prefixes:
@@ -398,9 +415,14 @@ class AriaStack(Stack):
 
         ingest_role = _role("ingest")
         tables["incidents"].grant_read_write_data(ingest_role)
-        buckets["bucket"].grant_write(ingest_role)
+        buckets["bucket"].grant_read_write(ingest_role)
         ingest_role.add_to_policy(iam.PolicyStatement(
-            actions=["transcribe:StartStreamTranscription"],
+            actions=[
+                "transcribe:StartStreamTranscription",
+                "transcribe:StartTranscriptionJob",
+                "transcribe:GetTranscriptionJob",
+                "transcribe:DeleteTranscriptionJob",
+            ],
             resources=["*"],
         ))
         ingest_role.add_to_policy(iam.PolicyStatement(
@@ -422,6 +444,7 @@ class AriaStack(Stack):
                 f"arn:aws:lambda:{self.region}:{self.account}:function:aria-medical-tool*",
                 f"arn:aws:lambda:{self.region}:{self.account}:function:aria-hazmat-tool*",
                 f"arn:aws:lambda:{self.region}:{self.account}:function:aria-verifier*",
+                f"arn:aws:lambda:{self.region}:{self.account}:function:aria-stream-processor*",
             ],
         ))
         stream_role.add_to_policy(iam.PolicyStatement(
@@ -465,6 +488,10 @@ class AriaStack(Stack):
         tables["units"].grant_read_write_data(navigation_role)
         tables["incidents"].grant_write_data(navigation_role)
         tables["connections"].grant_read_data(navigation_role)
+        navigation_role.add_to_policy(iam.PolicyStatement(
+            actions=["bedrock:InvokeModel"],
+            resources=["*"],
+        ))
         navigation_role.add_to_policy(iam.PolicyStatement(
             actions=["execute-api:ManageConnections"],
             resources=[f"arn:aws:execute-api:{self.region}:{self.account}:*"],
@@ -556,6 +583,8 @@ class AriaStack(Stack):
         ws_disconnect_role = _role("ws-disconnect")
         tables["connections"].grant_write_data(ws_disconnect_role)
 
+        ws_default_role = _role("ws-default")
+
         return {
             "ingest": ingest_role,
             "stream_processor": stream_role,
@@ -568,6 +597,7 @@ class AriaStack(Stack):
             "verifier": verifier_role,
             "ws_connect": ws_connect_role,
             "ws_disconnect": ws_disconnect_role,
+            "ws_default": ws_default_role,
         }
 
     # ─── Lambda Functions ────────────────────────────────────────────────────
@@ -699,6 +729,19 @@ class AriaStack(Stack):
             log_retention=logs.RetentionDays.ONE_WEEK,
         )
 
+        ws_default = lambda_.Function(
+            self, "WsDefaultFunction",
+            function_name="aria-ws-default",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            code=lambda_.Code.from_asset("backend/lambdas/aria-ws-default"),
+            handler="handler.lambda_handler",
+            memory_size=128,
+            timeout=Duration.seconds(5),
+            role=roles["ws_default"],
+            environment={**common_env, "POWERTOOLS_SERVICE_NAME": "aria-ws-default"},
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+
         return {
             "ingest": ingest,
             "stream_processor": stream_processor,
@@ -711,6 +754,7 @@ class AriaStack(Stack):
             "report": report,
             "ws_connect": ws_connect,
             "ws_disconnect": ws_disconnect,
+            "ws_default": ws_default,
         }
 
     # ─── Bedrock Multi-Agent Orchestration ───────────────────────────────────
@@ -1134,7 +1178,7 @@ class AriaStack(Stack):
             route_selection_expression="$request.body.action",
         )
 
-        for fn_key in ["ws_connect", "ws_disconnect"]:
+        for fn_key in ["ws_connect", "ws_disconnect", "ws_default"]:
             functions[fn_key].add_permission(
                 f"WsApiGateway{fn_key}",
                 principal=iam.ServicePrincipal("apigateway.amazonaws.com"),
@@ -1162,11 +1206,21 @@ class AriaStack(Stack):
             route_key="$disconnect", authorization_type="NONE",
             target=f"integrations/{disconnect_int.ref}")
 
+        default_int = apigwv2.CfnIntegration(
+            self, "WsDefaultIntegration",
+            api_id=ws_api.ref,
+            integration_type="AWS_PROXY",
+            integration_uri=f"arn:aws:apigateway:{self.region}:lambda:path/2015-03-31/functions/{functions['ws_default'].function_arn}/invocations",
+        )
+        apigwv2.CfnRoute(self, "WsDefaultRoute", api_id=ws_api.ref,
+            route_key="$default", authorization_type="NONE",
+            target=f"integrations/{default_int.ref}")
+
         apigwv2.CfnStage(self, "WsStage", api_id=ws_api.ref,
             stage_name="prod", auto_deploy=True)
 
         ws_endpoint = f"https://{ws_api.ref}.execute-api.{self.region}.amazonaws.com/prod"
-        for fn_key in ["stream_processor", "coordinator", "navigation", "medical", "hazmat", "verifier", "report"]:
+        for fn_key in ["ingest", "stream_processor", "coordinator", "navigation", "medical", "hazmat", "verifier", "report"]:
             functions[fn_key].add_environment("WS_ENDPOINT", ws_endpoint)
 
         return ws_api

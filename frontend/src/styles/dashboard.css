@@ -13,10 +13,10 @@
   --shadow-card: 0 1px 0 rgba(15, 23, 42, 0.04), 0 4px 12px -6px rgba(15,23,42,0.08);
 
   /* Type */
-  --text-primary: #0f172a;       /* slate 900 */
-  --text-secondary: #475569;     /* slate 600 */
-  --text-mono: #475569;
-  --text-dim: #94a3b8;           /* slate 400 */
+  --text-primary: #000000;
+  --text-secondary: #111827;
+  --text-mono: #111827;
+  --text-dim: #4b5563;
 
   /* Status — darker, saturated for light backgrounds */
   --critical: #dc2626;

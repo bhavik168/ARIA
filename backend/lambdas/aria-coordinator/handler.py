@@ -84,8 +84,6 @@ def lambda_handler(event, context):
     _push_to_dashboard(incident_id, {"type": "agent_started", "agent": "coordinator"})
 
     incident_data = _load_incident(incident_id)
-    if incident_data.get("recommendation_ready"):
-        return {"status": "already_complete"}
 
     # Enrich incident_data with verifier classification if available
     incident_data = _apply_verifier_enrichment(incident_id, incident_data)
@@ -397,21 +395,24 @@ def _apply_guardrail(card: dict) -> tuple[bool, str]:
 def _handle_approve(event: dict) -> dict:
     path_params = event.get("pathParameters") or {}
     incident_id = path_params.get("id", "")
+    body = json.loads(event.get("body") or "{}")
+    scope = body.get("scope", "full")
     table = dynamodb.Table(INCIDENTS_TABLE)
     try:
         table.update_item(
             Key={"incident_id": incident_id, "timestamp": "latest"},
-            UpdateExpression="SET dispatcher_approved = :t, approved_at_ms = :ts",
+            UpdateExpression="SET dispatcher_approved = :t, approved_at_ms = :ts, approval_scope = :s",
             ConditionExpression="attribute_exists(incident_id)",
             ExpressionAttributeValues={
                 ":t": True,
                 ":ts": int(time.time() * 1000),
+                ":s": scope,
             },
         )
     except table.meta.client.exceptions.ConditionalCheckFailedException:
         return _respond(404, {"error": "incident not found", "incident_id": incident_id})
-    _push_to_dashboard(incident_id, {"type": "dispatch_logged", "incident_id": incident_id})
-    return _respond(200, {"status": "approved", "incident_id": incident_id})
+    _push_to_dashboard(incident_id, {"type": "approved", "scope": scope, "incident_id": incident_id})
+    return _respond(200, {"status": "approved", "scope": scope, "incident_id": incident_id})
 
 
 def _handle_override(event: dict) -> dict:
@@ -519,25 +520,28 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
     global apigw_mgmt
     if not WS_ENDPOINT:
         return
-    if apigw_mgmt is None:
-        endpoint = WS_ENDPOINT.replace("wss://", "https://")
-        apigw_mgmt = boto3.client(
-            "apigatewaymanagementapi",
-            endpoint_url=endpoint,
-            region_name=os.environ["AWS_DEPLOY_REGION"],
-        )
-    conn_table = dynamodb.Table(CONNECTIONS_TABLE)
-    conns = conn_table.query(
-        IndexName="incident-index",
-        KeyConditionExpression="incident_id = :iid",
-        ExpressionAttributeValues={":iid": incident_id},
-    ).get("Items", [])
-    data = json.dumps(payload).encode()
-    for conn in conns:
-        try:
-            apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
-        except Exception:
-            pass
+    try:
+        if apigw_mgmt is None:
+            endpoint = WS_ENDPOINT.replace("wss://", "https://")
+            apigw_mgmt = boto3.client(
+                "apigatewaymanagementapi",
+                endpoint_url=endpoint,
+                region_name=os.environ["AWS_DEPLOY_REGION"],
+            )
+        conn_table = dynamodb.Table(CONNECTIONS_TABLE)
+        conns = conn_table.query(
+            IndexName="incident-index",
+            KeyConditionExpression="incident_id = :iid",
+            ExpressionAttributeValues={":iid": incident_id},
+        ).get("Items", [])
+        data = json.dumps(payload).encode()
+        for conn in conns:
+            try:
+                apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("_push_to_dashboard failed (non-fatal)", exc_info=e)
 
 
 def _respond(status: int, body: dict) -> dict:

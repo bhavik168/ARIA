@@ -215,6 +215,33 @@ export interface SimEventTranscript {
   kw?: KeywordCategory;
 }
 
+export interface BackendEventTranscriptWord {
+  type: "transcript_word";
+  word: string;
+  speaker: string;
+  timestamp_ms: number;
+  transcript_so_far?: string;
+}
+
+export interface BackendEventAgentStarted {
+  type: "agent_started";
+  agent: string;
+}
+
+export interface BackendEventAgentComplete {
+  type: "agent_complete";
+  agent: string;
+  elapsed_ms?: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  result?: Record<string, any>;
+}
+
+export interface BackendEventRecommendationReady {
+  type: "recommendation_ready";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  card: Record<string, any>;
+}
+
 export type DashboardEvent =
   | SimEventAgent
   | SimEventLog
@@ -226,4 +253,8 @@ export type DashboardEvent =
   | SimEventUnitState
   | SimEventMap
   | SimEventSessionEnd
-  | SimEventTranscript;
+  | SimEventTranscript
+  | BackendEventTranscriptWord
+  | BackendEventAgentStarted
+  | BackendEventAgentComplete
+  | BackendEventRecommendationReady;

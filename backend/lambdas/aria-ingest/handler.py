@@ -16,7 +16,6 @@ import json
 import os
 import uuid
 import time
-import threading
 import boto3
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
@@ -37,6 +36,26 @@ ARIA_BUCKET = os.environ.get("ARIA_BUCKET", "")
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    # Self-invoked simulation replay path — fires words after frontend has connected
+    if event.get("_replay_simulation"):
+        time.sleep(3)  # Give frontend time to open WebSocket and register in DynamoDB
+        _replay_simulation(
+            event["incident_id"],
+            event["simulation_transcript"],
+            event["t0_ms"],
+        )
+        return {"status": "ok"}
+
+    # Self-invoked polling path (not an API Gateway request)
+    if event.get("_poll_transcribe"):
+        result = poll_and_replay_transcript(
+            event["incident_id"],
+            event["job_name"],
+            event["t0_ms"],
+        )
+        logger.info("poll_and_replay done", extra=result)
+        return result
+
     http_method = event.get("httpMethod", "POST")
     path = event.get("path", "")
 
@@ -92,18 +111,20 @@ def _start_session(event: dict, context) -> dict:
     audio_file_key = body.get("audio_file_key", "")
 
     if simulation_transcript:
-        # Kick off simulation in background thread — Lambda stays warm during replay
-        thread = threading.Thread(
-            target=_replay_simulation,
-            args=(incident_id, simulation_transcript, t0_ms),
-            daemon=True,
+        # Async self-invoke so this response returns to the frontend BEFORE words start
+        # flowing. The frontend opens the WebSocket, ws-connect registers the connection,
+        # and only then (after the 3s sleep in the handler) do words arrive.
+        lambda_client.invoke(
+            FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "aria-ingest"),
+            InvocationType="Event",
+            Payload=json.dumps({
+                "_replay_simulation": True,
+                "incident_id": incident_id,
+                "simulation_transcript": simulation_transcript,
+                "t0_ms": t0_ms,
+            }).encode(),
         )
-        thread.start()
-        # Give thread enough time to fire at least first word before Lambda might recycle
-        # For longer replays, use a dedicated async Lambda
-        thread.join(timeout=min(context.get_remaining_time_in_millis() / 1000 - 2, 30))
-
-        logger.info("Simulation started", extra={"incident_id": incident_id})
+        logger.info("Simulation queued async", extra={"incident_id": incident_id})
         return _respond(200, {
             "incident_id": incident_id,
             "websocket_url": ws_url,
@@ -116,6 +137,22 @@ def _start_session(event: dict, context) -> dict:
         job_name = f"aria-{incident_id[:8]}-{int(time.time())}"
         _start_transcribe_job(incident_id, audio_file_key, job_name, t0_ms)
         logger.info("Transcribe job started", extra={"incident_id": incident_id, "job": job_name})
+
+        # Fire coordinator immediately so agents bootstrap and the frontend shows activity
+        # while Transcribe is still running. Coordinator re-fires with real context as words arrive.
+        try:
+            lambda_client.invoke(
+                FunctionName=COORDINATOR_FUNCTION,
+                InvocationType="Event",
+                Payload=json.dumps({
+                    "incident_id": incident_id,
+                    "context_so_far": "",
+                    "trigger_reason": "session_start",
+                }).encode(),
+            )
+        except Exception as e:
+            logger.warning("Failed to fire coordinator at session start", exc_info=e)
+
         return _respond(200, {
             "incident_id": incident_id,
             "websocket_url": ws_url,
@@ -206,7 +243,6 @@ def _start_transcribe_job(incident_id: str, audio_key: str, job_name: str, t0_ms
         },
         OutputBucketName=ARIA_BUCKET,
         OutputKey=f"transcripts/{incident_id}/{job_name}.json",
-        Tags=[{"Key": "incident_id", "Value": incident_id}],
     )
 
     # Store job name on incident for polling
@@ -215,6 +251,18 @@ def _start_transcribe_job(incident_id: str, audio_key: str, job_name: str, t0_ms
         Key={"incident_id": incident_id, "timestamp": "latest"},
         UpdateExpression="SET transcribe_job = :j, t0_ms = :t",
         ExpressionAttributeValues={":j": job_name, ":t": t0_ms},
+    )
+
+    # Self-invoke asynchronously to poll Transcribe and replay words
+    lambda_client.invoke(
+        FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "aria-ingest"),
+        InvocationType="Event",
+        Payload=json.dumps({
+            "_poll_transcribe": True,
+            "incident_id": incident_id,
+            "job_name": job_name,
+            "t0_ms": t0_ms,
+        }).encode(),
     )
 
 
@@ -235,8 +283,9 @@ def poll_and_replay_transcript(incident_id: str, job_name: str, t0_ms: int) -> d
             return {"status": "failed", "reason": reason}
         time.sleep(5)
 
-    transcript_uri = resp["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
-    words = _fetch_transcript_words(transcript_uri)
+    # Read directly from the known S3 key — avoids parsing the URI format
+    transcript_key = f"transcripts/{incident_id}/{job_name}.json"
+    words = _fetch_transcript_words_s3(ARIA_BUCKET, transcript_key)
 
     first = True
     for word_item in words:
@@ -267,17 +316,54 @@ def poll_and_replay_transcript(incident_id: str, job_name: str, t0_ms: int) -> d
                                value=ts_ms - t0_ms)
 
     _update_status(incident_id, "transcript_complete")
+
+    # Invoke coordinator to synthesize final recommendation card (mirrors simulation mode)
+    full_context = " ".join(
+        w.get("alternatives", [{}])[0].get("content", "")
+        for w in words
+        if w.get("type") != "punctuation" and w.get("alternatives", [{}])[0].get("content", "")
+    )
+    try:
+        lambda_client.invoke(
+            FunctionName=COORDINATOR_FUNCTION,
+            InvocationType="Event",
+            Payload=json.dumps({
+                "incident_id": incident_id,
+                "context_so_far": full_context,
+                "trigger_reason": "transcript_complete",
+            }).encode(),
+        )
+    except Exception as e:
+        logger.error("Failed to invoke coordinator after transcribe", exc_info=e)
+
     return {"status": "ok", "words_replayed": len(words)}
+
+
+def _fetch_transcript_words_s3(bucket: str, key: str) -> list:
+    """Fetch Transcribe output directly from S3 using known bucket/key."""
+    resp = s3_client.get_object(Bucket=bucket, Key=key)
+    data = json.loads(resp["Body"].read())
+    return data.get("results", {}).get("items", [])
 
 
 def _fetch_transcript_words(transcript_uri: str) -> list:
     """Download Transcribe output JSON from S3 and extract word items."""
-    # transcript_uri is an S3 URL; parse bucket and key
-    parsed = transcript_uri.replace("https://s3.amazonaws.com/", "")
-    parts = parsed.split("/", 1)
-    if len(parts) < 2:
+    from urllib.parse import urlparse
+    p = urlparse(transcript_uri)
+    # handles both path-style (s3.amazonaws.com/bucket/key)
+    # and virtual-hosted-style (bucket.s3.region.amazonaws.com/key)
+    if p.netloc.endswith("amazonaws.com"):
+        host_parts = p.netloc.split(".")
+        if host_parts[0] == "s3" or host_parts[0].startswith("s3-"):
+            # path-style: host = s3[.region].amazonaws.com, path = /bucket/key
+            path_parts = p.path.lstrip("/").split("/", 1)
+            bucket, key = path_parts[0], path_parts[1]
+        else:
+            # virtual-hosted-style: host = bucket.s3[.region].amazonaws.com
+            bucket = host_parts[0]
+            key = p.path.lstrip("/")
+    else:
         return []
-    bucket, key = parts[0], parts[1]
     resp = s3_client.get_object(Bucket=bucket, Key=key)
     data = json.loads(resp["Body"].read())
     return data.get("results", {}).get("items", [])

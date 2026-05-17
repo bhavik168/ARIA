@@ -153,6 +153,7 @@ export default function RecCard({
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
           <span
             style={{
+              flexShrink: 0,
               padding: "3px 9px",
               fontSize: 10,
               letterSpacing: "0.14em",
@@ -166,7 +167,17 @@ export default function RecCard({
             <span className="dot" style={{ marginRight: 5, color: "var(--critical)" }} />
             {severity.toUpperCase()}
           </span>
-          <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>
+          <span
+            style={{
+              fontSize: 14,
+              fontWeight: 600,
+              color: "var(--text-primary)",
+              overflow: "hidden",
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
+            }}
+          >
             {summary}
           </span>
         </div>
@@ -177,10 +188,13 @@ export default function RecCard({
             display: "flex",
             alignItems: "center",
             gap: 6,
+            overflow: "hidden",
           }}
         >
-          <span style={{ color: "var(--urgent)" }}>{icons.pin({ size: 13 })}</span>
-          {address}
+          <span style={{ color: "var(--urgent)", flexShrink: 0 }}>{icons.pin({ size: 13 })}</span>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {address}
+          </span>
         </div>
       </div>
 

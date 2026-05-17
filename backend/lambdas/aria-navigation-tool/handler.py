@@ -18,6 +18,7 @@ logger = Logger()
 metrics = Metrics()
 
 dynamodb = boto3.resource("dynamodb", region_name=os.environ["AWS_DEPLOY_REGION"])
+bedrock_runtime = boto3.client("bedrock-runtime", region_name=os.environ["AWS_DEPLOY_REGION"])
 apigw_mgmt = None
 
 UNITS_TABLE = os.environ["UNITS_TABLE"]
@@ -106,8 +107,45 @@ def _run_navigation(incident_id: str, context_so_far: str, incident_data: dict, 
 
 
 def _extract_location(context: str, incident_data: dict) -> dict:
-    # Placeholder — Phase 3 (Haiku verifier) resolves ambiguous addresses
-    return incident_data.get("location", {"address": context[:100], "lat": 37.7749, "lng": -122.4194})
+    if incident_data.get("location", {}).get("address"):
+        return incident_data["location"]
+    address = _nlp_extract_address(context)
+    return {"address": address, "lat": 47.6062, "lng": -122.3321}
+
+
+def _nlp_extract_address(context: str) -> str:
+    """Use Claude to extract incident location from 911 transcript text."""
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 80,
+        "temperature": 0,
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Extract the incident location from this 911 call transcript. "
+                "Return ONLY the location string — street address, intersection, "
+                "highway exit, or landmark. One line, no explanation.\n\n"
+                f"TRANSCRIPT:\n{context[:500]}"
+            ),
+        }],
+    })
+    for attempt in range(3):
+        try:
+            resp = bedrock_runtime.invoke_model(
+                modelId="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+            raw = json.loads(resp["body"].read())
+            return raw["content"][0]["text"].strip()[:200]
+        except Exception as e:
+            if "ThrottlingException" in type(e).__name__ and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            logger.warning("NLP location extraction failed", exc_info=e)
+            return "Seattle, WA — location pending"
+    return "Seattle, WA — location pending"
 
 
 def _get_available_units(trigger_reason: str) -> list:
@@ -201,22 +239,25 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
     global apigw_mgmt
     if not WS_ENDPOINT:
         return
-    if apigw_mgmt is None:
-        endpoint = WS_ENDPOINT.replace("wss://", "https://")
-        apigw_mgmt = boto3.client(
-            "apigatewaymanagementapi",
-            endpoint_url=endpoint,
-            region_name=os.environ["AWS_DEPLOY_REGION"],
-        )
-    conn_table = dynamodb.Table(CONNECTIONS_TABLE)
-    conns = conn_table.query(
-        IndexName="incident-index",
-        KeyConditionExpression="incident_id = :iid",
-        ExpressionAttributeValues={":iid": incident_id},
-    ).get("Items", [])
-    data = json.dumps(payload).encode()
-    for conn in conns:
-        try:
-            apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
-        except Exception:
-            pass
+    try:
+        if apigw_mgmt is None:
+            endpoint = WS_ENDPOINT.replace("wss://", "https://")
+            apigw_mgmt = boto3.client(
+                "apigatewaymanagementapi",
+                endpoint_url=endpoint,
+                region_name=os.environ["AWS_DEPLOY_REGION"],
+            )
+        conn_table = dynamodb.Table(CONNECTIONS_TABLE)
+        conns = conn_table.query(
+            IndexName="incident-index",
+            KeyConditionExpression="incident_id = :iid",
+            ExpressionAttributeValues={":iid": incident_id},
+        ).get("Items", [])
+        data = json.dumps(payload).encode()
+        for conn in conns:
+            try:
+                apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("_push_to_dashboard failed (non-fatal)", exc_info=e)
