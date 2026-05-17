@@ -192,7 +192,22 @@ When 15 callers report the same highway pile-up, each sees a different part. ARI
 
 ---
 
-### 2. Deploy AWS Infrastructure (CDK)
+### 2. Set GitHub Actions Secrets (CI/CD)
+
+If you want the CI/CD pipeline to auto-deploy on push to `main`, add these secrets to your repo under **Settings → Secrets and variables → Actions**:
+
+| Secret | Description |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | IAM access key for your deploy user |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret key for your deploy user |
+| `BEDROCK_KB_ID` | Bedrock Knowledge Base ID (from step 3 below) |
+| `BEDROCK_DS_ID` | Bedrock Data Source ID (from step 3 below) |
+
+> The `BEDROCK_KB_ID` and `BEDROCK_DS_ID` secrets tell CDK to reuse your existing Knowledge Base on every deploy instead of trying to recreate it.
+
+---
+
+### 3. Deploy AWS Infrastructure (CDK)
 
 Everything — DynamoDB tables, S3 bucket, 10 Lambda functions, REST API, WebSocket API, Bedrock Agents, Knowledge Base, and Guardrails — is deployed in a single `cdk deploy`.
 

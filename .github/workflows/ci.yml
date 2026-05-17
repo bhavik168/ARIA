@@ -124,8 +124,8 @@ jobs:
           --require-approval never
           --outputs-file cdk-outputs.json
           --app "python3 infrastructure/app.py"
-          --context existing_kb_id=N8QMM32V8T
-          --context existing_ds_id=IWWGB5POUX
+          --context existing_kb_id=${{ secrets.BEDROCK_KB_ID }}
+          --context existing_ds_id=${{ secrets.BEDROCK_DS_ID }}
 
       - name: Upload CDK outputs
         uses: actions/upload-artifact@v4
