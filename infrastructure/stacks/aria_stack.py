@@ -415,6 +415,7 @@ class AriaStack(Stack):
 
         ingest_role = _role("ingest")
         tables["incidents"].grant_read_write_data(ingest_role)
+        tables["connections"].grant_read_data(ingest_role)
         buckets["bucket"].grant_read_write(ingest_role)
         ingest_role.add_to_policy(iam.PolicyStatement(
             actions=[
@@ -428,6 +429,7 @@ class AriaStack(Stack):
         ingest_role.add_to_policy(iam.PolicyStatement(
             actions=["lambda:InvokeFunction"],
             resources=[
+                f"arn:aws:lambda:{self.region}:{self.account}:function:aria-ingest*",
                 f"arn:aws:lambda:{self.region}:{self.account}:function:aria-stream-processor*",
                 f"arn:aws:lambda:{self.region}:{self.account}:function:aria-coordinator*",
             ],

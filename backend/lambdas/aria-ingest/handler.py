@@ -205,14 +205,18 @@ def _wait_for_ws_connection(incident_id: str, max_wait_ms: int = 2000) -> bool:
     conn_table = dynamodb.Table(CONNECTIONS_TABLE)
     deadline = time.time() + max_wait_ms / 1000
     while time.time() < deadline:
-        items = conn_table.query(
-            IndexName="incident-index",
-            KeyConditionExpression="incident_id = :iid",
-            ExpressionAttributeValues={":iid": incident_id},
-        ).get("Items", [])
-        if items:
-            logger.info("WS connection detected, starting replay", extra={"incident_id": incident_id})
-            return True
+        try:
+            items = conn_table.query(
+                IndexName="incident-index",
+                KeyConditionExpression="incident_id = :iid",
+                ExpressionAttributeValues={":iid": incident_id},
+            ).get("Items", [])
+            if items:
+                logger.info("WS connection detected, starting replay", extra={"incident_id": incident_id})
+                return True
+        except Exception as e:
+            logger.warning("WS connection check failed (non-fatal), proceeding with replay", exc_info=e)
+            return False
         time.sleep(0.15)
     logger.warning("WS connection not detected within timeout, starting replay anyway", extra={"incident_id": incident_id})
     return False
