@@ -104,6 +104,8 @@ def _record_fire(incident_id: str, watcher: str, current_count: int) -> None:
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    if event.get("action") == "ping":
+        return {"status": "warm"}
     incident_id = event.get("incident_id", "")
     word = event.get("word", "")
     speaker = event.get("speaker_label", "caller")

@@ -42,6 +42,8 @@ _verifier_fired_agents: dict[str, set] = {}
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    if event.get("action") == "ping":
+        return {"status": "warm"}
     t0 = int(time.time() * 1000)
     incident_id = event.get("incident_id", "")
     transcript = event.get("context_so_far", "")

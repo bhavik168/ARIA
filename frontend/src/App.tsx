@@ -50,6 +50,7 @@ function makeInitialAgentStates(): AgentStates {
 
 export default function App() {
   // ---- Session state ----
+  const [showUploadModal, setShowUploadModal] = useState(true);
   const [sessionActive, setSessionActive] = useState(false);
   const [incidentId, setIncidentId]       = useState<string | null>(null);
   const [uploadState, setUploadState]     = useState<UploadState>("idle");
@@ -140,6 +141,7 @@ export default function App() {
     setReportUrl(null);
     setRecSummary(null);
     setRecAddress(null);
+    setShowUploadModal(true);
     sessionStartEpochRef.current = 0;
     wordPulses.current = [];
   }, []);
@@ -446,6 +448,7 @@ export default function App() {
       return;
     }
     reset();
+    setShowUploadModal(false);
     setAudioFileName(audioFile.name);
     setAudioObjectUrl(URL.createObjectURL(audioFile));
     setUploadState("uploading");
@@ -473,10 +476,26 @@ export default function App() {
       });
       if (!uploadRes.ok) throw new Error(`S3 upload failed: HTTP ${uploadRes.status}`);
 
-      // 3. File is ready — show the dashboard in standby. Pipeline fires on Play.
-      setPendingAudioKey(audio_key);
+      // 3. Upload done — immediately start the pipeline, no Play press needed.
       setAudioFileName(audioFile.name);
       setSessionActive(true);
+      setUploadState("processing");
+      const startRes = await fetch(`${API_BASE}/session/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audio_file_key: audio_key }),
+      });
+      if (!startRes.ok) throw new Error(`Session start failed: HTTP ${startRes.status}`);
+      const { incident_id, websocket_url } = await startRes.json() as {
+        incident_id: string;
+        websocket_url: string;
+      };
+      sessionStartEpochRef.current = Date.now();
+      setIncidentId(incident_id);
+      setPipelineStarted(true);
+      setPlaying(true);
+      startedAtRef.current = performance.now();
+      openWebSocket(incident_id, websocket_url);
       setUploadState("idle");
     } catch (err) {
       setUploadState("error");
@@ -596,6 +615,13 @@ export default function App() {
 
   const onStop = useCallback(() => reset(), [reset]);
 
+  // Ping all Lambdas on page load so cold starts are gone before the user uploads audio
+  useEffect(() => {
+    if (!IS_DEMO && API_BASE) {
+      fetch(`${API_BASE}/session/warmup`).catch(() => {});
+    }
+  }, []);
+
   // Spacebar shortcut (demo mode only)
   useEffect(() => {
     if (!IS_DEMO) return;
@@ -713,12 +739,13 @@ export default function App() {
   // =========================================================================
   return (
     <div className="app-grid" style={{ position: "relative" }}>
-      {!sessionActive && (
+      {(!sessionActive || showUploadModal) && (
         <IdleOverlay
           onStartDemo={startDemoSession}
           onStartBackend={startBackendSession}
           onFileSelect={startAudioSession}
           uploadState={uploadState}
+          onDismiss={sessionActive ? () => setShowUploadModal(false) : undefined}
         />
       )}
 

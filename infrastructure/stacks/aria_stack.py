@@ -649,9 +649,14 @@ class AriaStack(Stack):
             return fn
 
         ingest = _fn("Ingest", "aria-ingest", roles["ingest"],
+            timeout=600,
             extra_env={
                 "STREAM_PROCESSOR_FUNCTION": "aria-stream-processor",
                 "COORDINATOR_FUNCTION": "aria-coordinator",
+                "NAVIGATION_FUNCTION": "aria-navigation-tool",
+                "MEDICAL_FUNCTION": "aria-medical-tool",
+                "HAZMAT_FUNCTION": "aria-hazmat-tool",
+                "VERIFIER_FUNCTION": "aria-verifier",
             })
 
         stream_processor = _fn("StreamProcessor", "aria-stream-processor", roles["stream_processor"],

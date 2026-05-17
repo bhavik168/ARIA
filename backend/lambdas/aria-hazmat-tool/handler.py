@@ -47,6 +47,8 @@ HAZMAT_DEFAULTS = {
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    if event.get("action") == "ping":
+        return {"status": "warm"}
     if event.get("messageVersion") == "1.0" and "actionGroup" in event:
         return _handle_agent_action(event)
     return _handle_direct(event)

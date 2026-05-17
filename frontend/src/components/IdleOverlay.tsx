@@ -9,6 +9,7 @@ interface IdleOverlayProps {
   onStartBackend: () => void;
   onFileSelect: (file: File) => void;
   uploadState: UploadState;
+  onDismiss?: () => void;
 }
 
 const STATUS_ROWS: [string, string, boolean][] = [
@@ -32,6 +33,7 @@ export default function IdleOverlay({
   onStartBackend,
   onFileSelect,
   uploadState,
+  onDismiss,
 }: IdleOverlayProps) {
   const fileRef = useRef<HTMLInputElement>(null);
   const uploadLabel = uploadLabels[uploadState] ?? null;
@@ -170,6 +172,24 @@ export default function IdleOverlay({
             Requires VITE_API_BASE_URL and VITE_WS_URL configured in .env
           </div>
         </div>
+      )}
+
+      {onDismiss && (
+        <button
+          onClick={onDismiss}
+          style={{
+            background: "none",
+            border: "none",
+            color: "var(--text-dim)",
+            fontSize: 11,
+            letterSpacing: "0.08em",
+            cursor: "pointer",
+            padding: "4px 8px",
+            marginTop: 4,
+          }}
+        >
+          Skip → Continue to Dashboard
+        </button>
       )}
     </div>
   );

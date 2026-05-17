@@ -44,7 +44,7 @@ HAZMAT_AGENT_ALIAS_ID = os.environ.get("HAZMAT_AGENT_ALIAS_ID", "")
 
 SYNTHESIS_MODEL_ID = os.environ.get(
     "SYNTHESIS_MODEL_ID",
-    "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
 )
 
 # Timeout budgets (seconds)
@@ -58,6 +58,8 @@ AGENT_TIMEOUTS = {
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    if event.get("action") == "ping":
+        return {"status": "warm"}
     # Bedrock Agent action group invocation
     if event.get("messageVersion") == "1.0" and "actionGroup" in event:
         return _handle_agent_action(event)

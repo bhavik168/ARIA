@@ -97,12 +97,20 @@ vector_store/
 .bedrock_cache/
 
 # ── Audio samples (never commit real 911 audio) ──
-audio-samples/911-calls/*.wav
-audio-samples/911-calls/*.mp3
-audio-samples/911-calls/*.flac
-audio-samples/911-calls/*.m4a
-audio-samples/911-calls/*.ogg
-audio-samples/911-calls/*.aac
+audio-samples/**/*.wav
+audio-samples/**/*.mp3
+audio-samples/**/*.flac
+audio-samples/**/*.m4a
+audio-samples/**/*.ogg
+audio-samples/**/*.aac
+audio-samples/*.wav
+audio-samples/*.mp3
+
+# ── Audio generation scripts ──
+scripts/generate_test_calls.py
+scripts/package.json
+scripts/package-lock.json
+scripts/node_modules/
 
 # ── Knowledge base source documents (large files, not for git) ──
 knowledge-base/**/*.pdf

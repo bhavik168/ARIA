@@ -32,6 +32,8 @@ UNIT_TYPE_PRIORITY = {"ambulance": 1, "fire_engine": 2, "police": 3, "hazmat": 4
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    if event.get("action") == "ping":
+        return {"status": "warm"}
     # Route: Bedrock Agent action group invocation vs. direct Lambda call
     if event.get("messageVersion") == "1.0" and "actionGroup" in event:
         return _handle_agent_action(event)
@@ -141,7 +143,7 @@ def _nlp_extract_address(context: str) -> str:
             return raw["content"][0]["text"].strip()[:200]
         except Exception as e:
             if "ThrottlingException" in type(e).__name__ and attempt < 2:
-                time.sleep(2 ** attempt)
+                time.sleep(4 * (attempt + 1))
                 continue
             logger.warning("NLP location extraction failed", exc_info=e)
             return "Seattle, WA — location pending"

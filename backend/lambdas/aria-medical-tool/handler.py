@@ -58,6 +58,8 @@ def _detect_hospital_name(context: str) -> str | None:
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
+    if event.get("action") == "ping":
+        return {"status": "warm"}
     if event.get("messageVersion") == "1.0" and "actionGroup" in event:
         return _handle_agent_action(event)
     return _handle_direct(event)
@@ -204,7 +206,7 @@ def _interpret_protocol(kb_text: str, context: str, verifier: dict) -> str:
             return raw["content"][0]["text"].strip()
         except Exception as e:
             if "ThrottlingException" in type(e).__name__ and attempt < 2:
-                time.sleep(2 ** attempt)
+                time.sleep(4 * (attempt + 1))
                 continue
             logger.warning("Protocol interpretation failed — using raw KB text", exc_info=e)
             return kb_text[:500]

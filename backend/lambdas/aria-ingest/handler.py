@@ -29,8 +29,13 @@ transcribe_client = boto3.client("transcribe", region_name=os.environ["AWS_DEPLO
 s3_client = boto3.client("s3", region_name=os.environ["AWS_DEPLOY_REGION"])
 
 INCIDENTS_TABLE = os.environ["INCIDENTS_TABLE"]
+CONNECTIONS_TABLE = os.environ["CONNECTIONS_TABLE"]
 STREAM_PROCESSOR_FUNCTION = os.environ["STREAM_PROCESSOR_FUNCTION"]
 COORDINATOR_FUNCTION = os.environ.get("COORDINATOR_FUNCTION", "aria-coordinator")
+NAVIGATION_FUNCTION = os.environ.get("NAVIGATION_FUNCTION", "aria-navigation-tool")
+MEDICAL_FUNCTION = os.environ.get("MEDICAL_FUNCTION", "aria-medical-tool")
+HAZMAT_FUNCTION = os.environ.get("HAZMAT_FUNCTION", "aria-hazmat-tool")
+VERIFIER_FUNCTION = os.environ.get("VERIFIER_FUNCTION", "aria-verifier")
 ARIA_BUCKET = os.environ.get("ARIA_BUCKET", "")
 
 
@@ -38,7 +43,7 @@ ARIA_BUCKET = os.environ.get("ARIA_BUCKET", "")
 def lambda_handler(event, context):
     # Self-invoked simulation replay path — fires words after frontend has connected
     if event.get("_replay_simulation"):
-        time.sleep(3)  # Give frontend time to open WebSocket and register in DynamoDB
+        _wait_for_ws_connection(event["incident_id"], max_wait_ms=2000)
         _replay_simulation(
             event["incident_id"],
             event["simulation_transcript"],
@@ -59,6 +64,9 @@ def lambda_handler(event, context):
     http_method = event.get("httpMethod", "POST")
     path = event.get("path", "")
 
+    if http_method == "GET" and path.endswith("/warmup"):
+        return _warmup()
+
     if http_method == "GET":
         return _get_status(event)
 
@@ -69,6 +77,31 @@ def lambda_handler(event, context):
         return _presign_upload(event)
 
     return _respond(400, {"error": "Unknown route"})
+
+
+# ─── Warmup ──────────────────────────────────────────────────────────────────
+
+def _warmup() -> dict:
+    """Async-ping all downstream Lambdas so their containers are warm before a real call."""
+    fns = [
+        STREAM_PROCESSOR_FUNCTION,
+        COORDINATOR_FUNCTION,
+        NAVIGATION_FUNCTION,
+        MEDICAL_FUNCTION,
+        HAZMAT_FUNCTION,
+        VERIFIER_FUNCTION,
+    ]
+    for fn in fns:
+        try:
+            lambda_client.invoke(
+                FunctionName=fn,
+                InvocationType="Event",
+                Payload=b'{"action":"ping"}',
+            )
+        except Exception as e:
+            logger.warning(f"Warmup ping failed for {fn}", exc_info=e)
+    logger.info("Warmup pings dispatched", extra={"functions": fns})
+    return _respond(200, {"status": "warming"})
 
 
 # ─── Presign Upload ───────────────────────────────────────────────────────────
@@ -166,6 +199,24 @@ def _start_session(event: dict, context) -> dict:
 
 
 # ─── Simulation Mode ──────────────────────────────────────────────────────────
+
+def _wait_for_ws_connection(incident_id: str, max_wait_ms: int = 2000) -> bool:
+    """Poll connections table until the frontend WebSocket is registered or timeout."""
+    conn_table = dynamodb.Table(CONNECTIONS_TABLE)
+    deadline = time.time() + max_wait_ms / 1000
+    while time.time() < deadline:
+        items = conn_table.query(
+            IndexName="incident-index",
+            KeyConditionExpression="incident_id = :iid",
+            ExpressionAttributeValues={":iid": incident_id},
+        ).get("Items", [])
+        if items:
+            logger.info("WS connection detected, starting replay", extra={"incident_id": incident_id})
+            return True
+        time.sleep(0.15)
+    logger.warning("WS connection not detected within timeout, starting replay anyway", extra={"incident_id": incident_id})
+    return False
+
 
 def _replay_simulation(incident_id: str, transcript: list, t0_ms: int) -> None:
     """
