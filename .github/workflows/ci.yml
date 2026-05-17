@@ -65,11 +65,9 @@ jobs:
         run: cdk synth --no-lookups
 
   # ─── Frontend Build ───────────────────────────────────────────────
-  # Only runs when frontend source files exist (skipped until frontend is scaffolded)
   frontend-build:
     name: Frontend Build
     runs-on: ubuntu-latest
-    if: hashFiles('frontend/src/**/*.tsx') != '' || hashFiles('frontend/src/**/*.ts') != ''
     defaults:
       run:
         working-directory: frontend
