@@ -1,4 +1,5 @@
 """Unit tests for aria-coordinator Lambda handler."""
+import importlib.util
 import json
 import sys
 import os
@@ -8,7 +9,7 @@ import pytest
 from moto import mock_aws
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../backend/lambdas/aria-coordinator"))
+_HANDLER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../backend/lambdas/aria-coordinator/handler.py"))
 
 
 @pytest.fixture(autouse=True)
@@ -73,8 +74,11 @@ def dynamodb_tables(mock_incident_id):
 def _import_handler():
     if "handler" in sys.modules:
         del sys.modules["handler"]
-    import handler
-    return handler
+    spec = importlib.util.spec_from_file_location("handler", _HANDLER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["handler"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _make_lambda_response(payload: dict):
@@ -97,7 +101,7 @@ class TestCardSynthesis:
                 "triage_protocol": "BLS protocol",
             },
         }
-        card = handler._synthesize_card(mock_incident_id, "caller said not breathing", results, 0)
+        card = handler._synthesize_card(mock_incident_id, "caller said not breathing", results, {}, 0)
         assert card["incident_id"] == mock_incident_id
         assert "severity" in card
         assert "recommended_unit" in card
@@ -111,7 +115,7 @@ class TestCardSynthesis:
             "navigation": {"status": "ok"},
             "medical": {"status": "ok"},
         }
-        card = handler._synthesize_card(mock_incident_id, "context", results, 0)
+        card = handler._synthesize_card(mock_incident_id, "context", results, {}, 0)
         assert card["ai_confidence"] == "high"
 
     def test_card_confidence_low_when_agent_failed(self, dynamodb_tables, mock_incident_id):
@@ -120,13 +124,13 @@ class TestCardSynthesis:
             "navigation": {"status": "failed", "error": "timeout"},
             "medical": {"status": "ok"},
         }
-        card = handler._synthesize_card(mock_incident_id, "context", results, 0)
+        card = handler._synthesize_card(mock_incident_id, "context", results, {}, 0)
         assert card["ai_confidence"] == "low"
 
     def test_hazard_warnings_empty_for_medical(self, dynamodb_tables, mock_incident_id):
         handler = _import_handler()
         results = {"navigation": {"status": "ok"}, "medical": {"status": "ok"}}
-        card = handler._synthesize_card(mock_incident_id, "context", results, 0)
+        card = handler._synthesize_card(mock_incident_id, "context", results, {}, 0)
         assert isinstance(card["hazard_warnings"], list)
 
     def test_hazard_warnings_populated_for_hazmat(self, dynamodb_tables, mock_incident_id):
@@ -138,7 +142,7 @@ class TestCardSynthesis:
                 "hazard_warnings": ["chlorine", "evacuation 300m"],
             },
         }
-        card = handler._synthesize_card(mock_incident_id, "chlorine spill", results, 0)
+        card = handler._synthesize_card(mock_incident_id, "chlorine spill", results, {}, 0)
         assert card["hazard_warnings"] == ["chlorine", "evacuation 300m"]
 
 

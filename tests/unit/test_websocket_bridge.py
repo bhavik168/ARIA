@@ -1,4 +1,5 @@
 """Unit tests for shared WebSocket push utility."""
+import importlib.util
 import sys
 import os
 from unittest.mock import patch, MagicMock
@@ -7,7 +8,7 @@ import pytest
 from moto import mock_aws
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../backend/shared/utils"))
+_MODULE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../backend/shared/utils/websocket.py"))
 
 
 @pytest.fixture(autouse=True)
@@ -39,8 +40,11 @@ def connections_table():
 def _import_module():
     if "websocket" in sys.modules:
         del sys.modules["websocket"]
-    import websocket
-    return websocket
+    spec = importlib.util.spec_from_file_location("websocket", _MODULE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["websocket"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestPushEventNoEndpoint:

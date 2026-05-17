@@ -1,4 +1,5 @@
 """Unit tests for aria-navigation-tool Lambda handler."""
+import importlib.util
 import json
 import sys
 import os
@@ -8,7 +9,7 @@ import pytest
 from moto import mock_aws
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../backend/lambdas/aria-navigation-tool"))
+_HANDLER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../backend/lambdas/aria-navigation-tool/handler.py"))
 
 
 @pytest.fixture(autouse=True)
@@ -78,11 +79,13 @@ def dynamodb_tables(sample_units):
 
 
 def _import_handler():
-    """Re-import handler inside mock context so module-level clients are mocked."""
     if "handler" in sys.modules:
         del sys.modules["handler"]
-    import handler
-    return handler
+    spec = importlib.util.spec_from_file_location("handler", _HANDLER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["handler"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestUnitTypeMapping:

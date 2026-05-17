@@ -1,4 +1,5 @@
 """Unit tests for aria-hazmat-tool Lambda handler."""
+import importlib.util
 import sys
 import os
 from unittest.mock import patch
@@ -7,7 +8,7 @@ import pytest
 from moto import mock_aws
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../backend/lambdas/aria-hazmat-tool"))
+_HANDLER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../backend/lambdas/aria-hazmat-tool/handler.py"))
 
 
 @pytest.fixture(autouse=True)
@@ -50,8 +51,11 @@ def dynamodb_tables():
 def _import_handler():
     if "handler" in sys.modules:
         del sys.modules["handler"]
-    import handler
-    return handler
+    spec = importlib.util.spec_from_file_location("handler", _HANDLER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["handler"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestDefaultProtocols:

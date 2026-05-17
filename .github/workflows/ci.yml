@@ -56,13 +56,12 @@ jobs:
           pip install -r infrastructure/requirements.txt
 
       - name: CDK Synth (no deploy — validates stack is valid CloudFormation)
-        working-directory: infrastructure
         env:
           AWS_ACCOUNT_ID: "000000000000"
           AWS_REGION: us-west-2
           CDK_DEFAULT_ACCOUNT: "000000000000"
           CDK_DEFAULT_REGION: us-west-2
-        run: cdk synth --no-lookups
+        run: cdk synth --no-lookups --app "python3 infrastructure/app.py"
 
   # ─── Frontend Build ───────────────────────────────────────────────
   frontend-build:

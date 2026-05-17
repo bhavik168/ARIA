@@ -343,6 +343,8 @@ def _synthesize_card(incident_id: str, context: str, results: dict, incident_dat
 
 
 def _synthesize_card_fallback(nav: dict, med: dict, haz: dict, context: str) -> dict:
+    agents_ok = all(r.get("status") == "ok" for r in (nav, med) if r)
+    confidence = "high" if agents_ok else "low"
     return {
         "incident_type": nav.get("incident_type", "unknown"),
         "severity": "urgent",
@@ -350,7 +352,7 @@ def _synthesize_card_fallback(nav: dict, med: dict, haz: dict, context: str) -> 
         "dispatcher_action": "Dispatch recommended unit — manual verification required.",
         "triage_protocol": med.get("triage_protocol"),
         "hazard_warnings": haz.get("hazard_warnings", []),
-        "ai_confidence": "low",
+        "ai_confidence": confidence,
         "reasoning_summary": "Fallback synthesis — Sonnet unavailable.",
     }
 
@@ -396,14 +398,18 @@ def _handle_approve(event: dict) -> dict:
     path_params = event.get("pathParameters") or {}
     incident_id = path_params.get("id", "")
     table = dynamodb.Table(INCIDENTS_TABLE)
-    table.update_item(
-        Key={"incident_id": incident_id, "timestamp": "latest"},
-        UpdateExpression="SET dispatcher_approved = :t, approved_at_ms = :ts",
-        ExpressionAttributeValues={
-            ":t": True,
-            ":ts": int(time.time() * 1000),
-        },
-    )
+    try:
+        table.update_item(
+            Key={"incident_id": incident_id, "timestamp": "latest"},
+            UpdateExpression="SET dispatcher_approved = :t, approved_at_ms = :ts",
+            ConditionExpression="attribute_exists(incident_id)",
+            ExpressionAttributeValues={
+                ":t": True,
+                ":ts": int(time.time() * 1000),
+            },
+        )
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        return _respond(404, {"error": "incident not found", "incident_id": incident_id})
     _push_to_dashboard(incident_id, {"type": "dispatch_logged", "incident_id": incident_id})
     return _respond(200, {"status": "approved", "incident_id": incident_id})
 

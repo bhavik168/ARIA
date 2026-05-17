@@ -1,4 +1,5 @@
 """Unit tests for aria-medical-tool Lambda handler."""
+import importlib.util
 import json
 import sys
 import os
@@ -8,7 +9,7 @@ import pytest
 from moto import mock_aws
 import boto3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../backend/lambdas/aria-medical-tool"))
+_HANDLER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../backend/lambdas/aria-medical-tool/handler.py"))
 
 
 @pytest.fixture(autouse=True)
@@ -69,8 +70,11 @@ def dynamodb_tables(sample_hospitals):
 def _import_handler():
     if "handler" in sys.modules:
         del sys.modules["handler"]
-    import handler
-    return handler
+    spec = importlib.util.spec_from_file_location("handler", _HANDLER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["handler"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestTriageProtocolFallback:
@@ -91,7 +95,7 @@ class TestTriageProtocolFallback:
 class TestHospitalSelection:
     def test_finds_accepting_hospital(self, dynamodb_tables):
         handler = _import_handler()
-        hospital = handler._find_closest_hospital({"incident_type": "medical"})
+        hospital = handler._find_closest_hospital({"incident_type": "medical"}, None)
         assert hospital["hospital_id"] in ("H001", "H002")
         assert hospital["er_status"] in ("accepting", "preparing")
 
@@ -111,13 +115,13 @@ class TestHospitalSelection:
             BillingMode="PAY_PER_REQUEST",
         )
         handler = _import_handler()
-        hospital = handler._find_closest_hospital({})
+        hospital = handler._find_closest_hospital({}, None)
         assert "hospital_id" in hospital
         assert "name" in hospital
 
     def test_hospital_has_required_fields(self, dynamodb_tables):
         handler = _import_handler()
-        hospital = handler._find_closest_hospital({"incident_type": "cardiac"})
+        hospital = handler._find_closest_hospital({"incident_type": "cardiac"}, None)
         assert "hospital_id" in hospital
         assert "name" in hospital
         assert "eta_minutes" in hospital
