@@ -119,8 +119,7 @@ jobs:
           pip install -r infrastructure/requirements.txt
 
       - name: CDK Deploy
-        working-directory: infrastructure
-        run: cdk deploy AriaStack --require-approval never --outputs-file ../cdk-outputs.json
+        run: cdk deploy AriaStack --require-approval never --outputs-file cdk-outputs.json --app "python3 infrastructure/app.py"
 
       - name: Upload CDK outputs
         uses: actions/upload-artifact@v4
