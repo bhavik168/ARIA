@@ -118,6 +118,13 @@ jobs:
           npm install -g aws-cdk
           pip install -r infrastructure/requirements.txt
 
+      - name: Bundle Lambda dependencies
+        run: |
+          pip install aws-lambda-powertools --quiet
+          for dir in backend/lambdas/*/; do
+            pip install aws-lambda-powertools -t "$dir" --quiet --upgrade
+          done
+
       - name: CDK Deploy
         run: >
           cdk deploy AriaStack
