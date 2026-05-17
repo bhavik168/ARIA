@@ -31,6 +31,7 @@ s3_client = boto3.client("s3", region_name=os.environ["AWS_DEPLOY_REGION"])
 
 INCIDENTS_TABLE = os.environ["INCIDENTS_TABLE"]
 STREAM_PROCESSOR_FUNCTION = os.environ["STREAM_PROCESSOR_FUNCTION"]
+COORDINATOR_FUNCTION = os.environ.get("COORDINATOR_FUNCTION", "aria-coordinator")
 ARIA_BUCKET = os.environ.get("ARIA_BUCKET", "")
 
 
@@ -167,6 +168,21 @@ def _replay_simulation(incident_id: str, transcript: list, t0_ms: int) -> None:
 
     # Mark incident as transcription complete
     _update_status(incident_id, "transcript_complete")
+
+    # Invoke coordinator to synthesize final recommendation card
+    full_context = " ".join(e.get("word", "") for e in transcript if e.get("word"))
+    try:
+        lambda_client.invoke(
+            FunctionName=COORDINATOR_FUNCTION,
+            InvocationType="Event",
+            Payload=json.dumps({
+                "incident_id": incident_id,
+                "context_so_far": full_context,
+                "trigger_reason": "transcript_complete",
+            }).encode(),
+        )
+    except Exception as e:
+        logger.error("Failed to invoke coordinator", exc_info=e)
 
 
 # ─── Transcribe Batch Mode ────────────────────────────────────────────────────

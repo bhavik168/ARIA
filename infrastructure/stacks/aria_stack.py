@@ -405,7 +405,10 @@ class AriaStack(Stack):
         ))
         ingest_role.add_to_policy(iam.PolicyStatement(
             actions=["lambda:InvokeFunction"],
-            resources=[f"arn:aws:lambda:{self.region}:{self.account}:function:aria-stream-processor*"],
+            resources=[
+                f"arn:aws:lambda:{self.region}:{self.account}:function:aria-stream-processor*",
+                f"arn:aws:lambda:{self.region}:{self.account}:function:aria-coordinator*",
+            ],
         ))
 
         stream_role = _role("stream-processor")
@@ -616,7 +619,10 @@ class AriaStack(Stack):
             return fn
 
         ingest = _fn("Ingest", "aria-ingest", roles["ingest"],
-            extra_env={"STREAM_PROCESSOR_FUNCTION": "aria-stream-processor"})
+            extra_env={
+                "STREAM_PROCESSOR_FUNCTION": "aria-stream-processor",
+                "COORDINATOR_FUNCTION": "aria-coordinator",
+            })
 
         stream_processor = _fn("StreamProcessor", "aria-stream-processor", roles["stream_processor"],
             extra_env={
