@@ -8,7 +8,6 @@
 
 [![AWS](https://img.shields.io/badge/AWS-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white)](https://aws.amazon.com/)
 [![Amazon Bedrock](https://img.shields.io/badge/Amazon%20Bedrock-4B0082?style=for-the-badge&logo=amazon&logoColor=white)](https://aws.amazon.com/bedrock/)
-[![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)](https://react.dev/)
 [![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
 
@@ -20,7 +19,7 @@
 
 911 dispatchers are the invisible first responders. You never see them on the news. They never get the parade. But they are the voice that holds you together in the worst moment of your life, and they do it alone, under pressure, with tools that were never built to help them think.
 
-**ARIA exists to give dispatchers the backup they have never had.**
+**ARIA exists to give dispatchers the real time backup companion they have never had.**
 
 Not a better data screen. Not a smarter CAD system. A real-time thinking partner that listens alongside the dispatcher, processes everything simultaneously, handles backend coordination in the background, and surfaces a single clear recommendation so the human can stay focused on the one thing that matters: the person on the other end of the line.
 
