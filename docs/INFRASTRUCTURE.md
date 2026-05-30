@@ -15,11 +15,14 @@ Set up every AWS service by hand through the console. Work top to bottom — eac
 
 1. Go to **Amazon Bedrock → Model access** (left sidebar)
 2. Click **Manage model access**
-3. Check these three:
-   - **Anthropic → Claude Haiku 3.5**
-   - **Anthropic → Claude Sonnet 4**
+3. Check these:
+   - **Anthropic → Claude Haiku 3.5** (verifier, medical/hazmat protocol interpretation)
+   - **Anthropic → Claude Sonnet 4** (after-action report)
+   - **Anthropic → Claude Sonnet 4.5** (coordinator synthesis, navigation/medical NLP) — **required**: the coordinator, medical, and navigation Lambdas call `us.anthropic.claude-sonnet-4-5-...`. Without it those calls fail with AccessDenied and silently fall back.
    - **Amazon → Titan Text Embeddings V2**
 4. Click **Save changes** — wait for status to show **Access granted**
+
+> The code uses **cross-region inference profile** IDs (the `us.` prefix, e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). Enabling access in us-west-2 covers these. All model IDs are overridable via the `*_MODEL_ID` env vars on each Lambda if you need to pin a different version.
 
 ---
 
@@ -145,11 +148,23 @@ Add inline policy (Actions → Create inline policy → JSON):
     {
       "Effect": "Allow",
       "Action": ["lambda:InvokeFunction"],
-      "Resource": "arn:aws:lambda:us-west-2:{account-id}:function:aria-stream-processor*"
+      "Resource": [
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-stream-processor*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-coordinator*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-navigation-tool*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-medical-tool*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-hazmat-tool*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-verifier*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-ingest*"
+      ]
     }
   ]
 }
 ```
+
+> `aria-ingest` invokes the coordinator at `transcript_complete` and pings the
+> downstream functions on `/session/warmup`, so it needs invoke rights on all of
+> them (and on itself for the async replay/poll self-invocations).
 
 ---
 
@@ -181,7 +196,9 @@ Inline policy:
         "arn:aws:lambda:us-west-2:{account-id}:function:aria-coordinator*",
         "arn:aws:lambda:us-west-2:{account-id}:function:aria-navigation-tool*",
         "arn:aws:lambda:us-west-2:{account-id}:function:aria-medical-tool*",
-        "arn:aws:lambda:us-west-2:{account-id}:function:aria-hazmat-tool*"
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-hazmat-tool*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-verifier*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-stream-processor*"
       ]
     },
     {
@@ -198,6 +215,9 @@ Inline policy:
   ]
 }
 ```
+
+> The stream processor fires the semantic verifier and self-invokes for context
+> checkpoints, so it needs invoke rights on `aria-verifier` and `aria-stream-processor`.
 
 ---
 
@@ -274,6 +294,11 @@ Inline policy:
     },
     {
       "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
       "Action": ["dynamodb:Query"],
       "Resource": "arn:aws:dynamodb:us-west-2:{account-id}:table/aria-ws-connections/index/incident-index"
     },
@@ -322,7 +347,7 @@ Inline policy:
     },
     {
       "Effect": "Allow",
-      "Action": ["bedrock:Retrieve"],
+      "Action": ["bedrock:Retrieve", "bedrock:InvokeModel"],
       "Resource": "*"
     },
     {
@@ -367,7 +392,7 @@ Inline policy:
     },
     {
       "Effect": "Allow",
-      "Action": ["bedrock:Retrieve"],
+      "Action": ["bedrock:Retrieve", "bedrock:InvokeModel"],
       "Resource": "*"
     },
     {
@@ -426,7 +451,7 @@ Inline policy:
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:PutObject"],
+      "Action": ["s3:PutObject", "s3:GetObject"],
       "Resource": "arn:aws:s3:::aria-{account-id}/*"
     },
     {
@@ -442,6 +467,9 @@ Inline policy:
   ]
 }
 ```
+
+> `s3:GetObject` is needed so the report Lambda can issue a **presigned GET URL**
+> for the after-action report (the dashboard "Download Report" link).
 
 ---
 
@@ -483,7 +511,60 @@ Inline policy:
 
 ---
 
-## 5. Lambda Functions — 10 Functions
+### Role 11: `aria-verifier-role`
+Attach: **AWSLambdaBasicExecutionRole**
+
+Inline policy:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:us-west-2:{account-id}:table/aria-incidents"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:Query"],
+      "Resource": "arn:aws:dynamodb:us-west-2:{account-id}:table/aria-ws-connections/index/incident-index"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["lambda:InvokeFunction"],
+      "Resource": [
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-navigation-tool*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-medical-tool*",
+        "arn:aws:lambda:us-west-2:{account-id}:function:aria-hazmat-tool*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["execute-api:ManageConnections"],
+      "Resource": "arn:aws:execute-api:us-west-2:{account-id}:*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["cloudwatch:PutMetricData"],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"cloudwatch:namespace": "ARIA/Latency"}}
+    }
+  ]
+}
+```
+
+> The verifier classifies the transcript with Claude Haiku 3.5, triggers any
+> specialist agents the keyword watchers missed, and writes its classification
+> back to `aria-incidents` for the coordinator to read.
+
+---
+
+## 5. Lambda Functions — 11 Functions
 
 Go to **Lambda → Create function → Author from scratch**
 - Runtime: **Python 3.12**
@@ -509,12 +590,22 @@ HOSPITALS_TABLE               aria-hospitals
 OVERRIDES_TABLE               aria-overrides
 CONNECTIONS_TABLE             aria-ws-connections
 STREAM_PROCESSOR_FUNCTION     aria-stream-processor
+COORDINATOR_FUNCTION          aria-coordinator
+NAVIGATION_FUNCTION           aria-navigation-tool
+MEDICAL_FUNCTION              aria-medical-tool
+HAZMAT_FUNCTION               aria-hazmat-tool
+VERIFIER_FUNCTION             aria-verifier
+WS_ENDPOINT                   (fill in after WebSocket API is created)
 ARIA_BUCKET                   aria-{account-id}
 POWERTOOLS_SERVICE_NAME       aria-ingest
 POWERTOOLS_METRICS_NAMESPACE  ARIA/Latency
 LOG_LEVEL                     INFO
 ```
 Provisioned Concurrency: **5**
+
+> `aria-ingest` fires the coordinator at `transcript_complete` and warms the
+> downstream functions on `/session/warmup`, so it needs their names here and
+> `lambda:InvokeFunction` rights on them (see Role 1).
 
 ---
 
@@ -532,6 +623,8 @@ COORDINATOR_FUNCTION          aria-coordinator
 NAVIGATION_FUNCTION           aria-navigation-tool
 MEDICAL_FUNCTION              aria-medical-tool
 HAZMAT_FUNCTION               aria-hazmat-tool
+VERIFIER_FUNCTION             aria-verifier
+STREAM_PROCESSOR_FUNCTION     aria-stream-processor
 WS_ENDPOINT                   (fill in after WebSocket API is created)
 POWERTOOLS_SERVICE_NAME       aria-stream-processor
 POWERTOOLS_METRICS_NAMESPACE  ARIA/Latency
@@ -691,6 +784,33 @@ LOG_LEVEL                     INFO
 
 ---
 
+### Function 11: `aria-verifier`
+| Memory | Timeout | Role |
+|---|---|---|
+| 512 MB | 30 sec | `aria-verifier-role` |
+
+Code: `backend/lambdas/aria-verifier/handler.py`
+
+Environment variables:
+```
+AWS_DEPLOY_REGION             us-west-2
+INCIDENTS_TABLE               aria-incidents
+CONNECTIONS_TABLE             aria-ws-connections
+NAVIGATION_FUNCTION           aria-navigation-tool
+MEDICAL_FUNCTION              aria-medical-tool
+HAZMAT_FUNCTION               aria-hazmat-tool
+WS_ENDPOINT                   (fill in after WebSocket API is created)
+POWERTOOLS_SERVICE_NAME       aria-verifier
+POWERTOOLS_METRICS_NAMESPACE  ARIA/Latency
+LOG_LEVEL                     INFO
+```
+
+> Required. The stream processor invokes this every ~10 words. Without it the
+> verifier enrichment (severity upgrades, incident-type correction, missed-agent
+> triggers) never runs and the coordinator's `verifier_classification` stays empty.
+
+---
+
 ## 6. Provisioned Concurrency
 
 > Eliminates cold starts on the 5 functions that must respond instantly.
@@ -761,6 +881,14 @@ Go to **API Gateway → Create API → WebSocket API**
 |---|---|---|
 | `$connect` | Lambda | `aria-ws-connect` |
 | `$disconnect` | Lambda | `aria-ws-disconnect` |
+| `$default` | Lambda | `aria-ws-default` |
+
+> The `$default` route is **required**. The dashboard sends a `{"action":"ping"}`
+> keepalive every 20s; without a `$default` integration API Gateway has nowhere to
+> route it and can drop the socket. `aria-ws-default` (code:
+> `backend/lambdas/aria-ws-default/handler.py`) just acknowledges and returns 200.
+> Create it as a small function (256 MB / 10 sec) using the basic
+> `AWSLambdaBasicExecutionRole` — it needs no extra permissions.
 
 ### Deploy:
 **Actions → Deploy** → stage name `prod`
@@ -769,8 +897,8 @@ Copy the **WebSocket URL** — looks like:
 `wss://def456uvw.execute-api.us-west-2.amazonaws.com/prod`
 
 ### Update Lambda env vars:
-Go back to all 6 functions that have a `WS_ENDPOINT` env var and fill it in:
-`aria-stream-processor`, `aria-coordinator`, `aria-navigation-tool`, `aria-medical-tool`, `aria-hazmat-tool`, `aria-report`
+Go back to all 7 functions that have a `WS_ENDPOINT` env var and fill it in:
+`aria-stream-processor`, `aria-coordinator`, `aria-navigation-tool`, `aria-medical-tool`, `aria-hazmat-tool`, `aria-report`, `aria-verifier`
 
 ---
 
@@ -794,9 +922,10 @@ cd ~/aria/frontend   # or wherever you cloned the repo
 npm install
 ```
 
-Create `frontend/.env.local`:
+Create `frontend/.env.local` (note: the var is `VITE_API_BASE_URL`, which is what
+`frontend/src/App.tsx` actually reads — not `VITE_API_URL`):
 ```
-VITE_API_URL=https://{your-rest-api-id}.execute-api.us-west-2.amazonaws.com/prod
+VITE_API_BASE_URL=https://{your-rest-api-id}.execute-api.us-west-2.amazonaws.com/prod
 VITE_WS_URL=wss://{your-ws-api-id}.execute-api.us-west-2.amazonaws.com/prod
 VITE_MAPBOX_TOKEN={your-mapbox-token}
 ```
@@ -813,18 +942,19 @@ Open `http://localhost:5173` — that's your dispatcher dashboard.
 ## Completion Checklist
 
 ```
-[ ] Bedrock model access granted for Claude Haiku 3.5, Sonnet 4, Titan Embeddings V2
+[ ] Bedrock model access granted for Claude Haiku 3.5, Sonnet 4, Sonnet 4.5, Titan Embeddings V2
 [ ] 5 DynamoDB tables created with correct keys and GSIs
-[ ] 4 S3 buckets created with correct names and lifecycle rules
-[ ] 10 IAM roles created with least-privilege inline policies
-[ ] 10 Lambda functions created — correct memory, timeout, env vars
+[ ] 1 S3 bucket created (aria-{account-id}) with correct name
+[ ] 11 IAM roles created with least-privilege inline policies (incl. aria-verifier-role)
+[ ] 11 Lambda functions created — correct memory, timeout, env vars (incl. aria-verifier)
+[ ] aria-ws-default function created and wired to the $default route
 [ ] Code uploaded to each Lambda function
 [ ] Provisioned Concurrency set on 5 critical functions
 [ ] REST API deployed — 5 routes wired to Lambda
-[ ] WebSocket API deployed — $connect and $disconnect wired to Lambda
-[ ] WS_ENDPOINT env var updated in 6 Lambda functions
+[ ] WebSocket API deployed — $connect, $disconnect, and $default wired to Lambda
+[ ] WS_ENDPOINT env var updated in 7 Lambda functions
 [ ] Demo data seeded: python scripts/seed_units.py
-[ ] Frontend running at localhost:5173
+[ ] Frontend running at localhost:5173 (VITE_API_BASE_URL / VITE_WS_URL set)
 ```
 
 **Next: Phase 2 — Knowledge Base**

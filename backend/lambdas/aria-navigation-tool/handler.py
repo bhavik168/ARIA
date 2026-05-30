@@ -10,6 +10,7 @@ import os
 import time
 import urllib.request
 import urllib.parse
+from decimal import Decimal
 import boto3
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
@@ -146,8 +147,8 @@ def _nlp_extract_address(context: str) -> str:
                 time.sleep(4 * (attempt + 1))
                 continue
             logger.warning("NLP location extraction failed", exc_info=e)
-            return "Seattle, WA — location pending"
-    return "Seattle, WA — location pending"
+            return "Location not yet confirmed"
+    return "Location not yet confirmed"
 
 
 def _get_available_units(trigger_reason: str) -> list:
@@ -226,6 +227,17 @@ def _google_maps_eta(origin: str, destination: str) -> tuple[int, str]:
     return eta_minutes, maps_url
 
 
+def _to_dynamo(obj):
+    """Recursively convert float → Decimal for DynamoDB compatibility."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _to_dynamo(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_dynamo(v) for v in obj]
+    return obj
+
+
 def _log_dispatch_event(incident_id: str, unit: dict, t0: int) -> None:
     if not unit:
         return
@@ -233,7 +245,7 @@ def _log_dispatch_event(incident_id: str, unit: dict, t0: int) -> None:
     table.update_item(
         Key={"incident_id": incident_id, "timestamp": "latest"},
         UpdateExpression="SET navigation_result = :nav, navigation_at_ms = :ts",
-        ExpressionAttributeValues={":nav": unit, ":ts": t0},
+        ExpressionAttributeValues={":nav": _to_dynamo(unit), ":ts": t0},
     )
 
 
@@ -255,10 +267,12 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
             KeyConditionExpression="incident_id = :iid",
             ExpressionAttributeValues={":iid": incident_id},
         ).get("Items", [])
-        data = json.dumps(payload).encode()
+        data = json.dumps(payload, default=str).encode()
         for conn in conns:
             try:
                 apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+            except apigw_mgmt.exceptions.GoneException:
+                conn_table.delete_item(Key={"connection_id": conn["connection_id"]})
             except Exception:
                 pass
     except Exception as e:

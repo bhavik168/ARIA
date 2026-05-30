@@ -276,9 +276,11 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
         KeyConditionExpression="incident_id = :iid",
         ExpressionAttributeValues={":iid": incident_id},
     ).get("Items", [])
-    data = json.dumps(payload).encode()
+    data = json.dumps(payload, default=str).encode()
     for conn in conns:
         try:
             apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+        except apigw_mgmt.exceptions.GoneException:
+            conn_table.delete_item(Key={"connection_id": conn["connection_id"]})
         except Exception:
             pass

@@ -7,6 +7,7 @@ Uses FEMA ERG and NIOSH guides from Bedrock Knowledge Base.
 import json
 import os
 import time
+from decimal import Decimal
 import boto3
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
@@ -199,12 +200,23 @@ def _build_result(kb_result: dict, is_hazmat: bool) -> dict:
     return result
 
 
+def _to_dynamo(obj):
+    """Recursively convert float → Decimal for DynamoDB compatibility."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _to_dynamo(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_dynamo(v) for v in obj]
+    return obj
+
+
 def _update_incident(incident_id: str, result: dict, t0: int) -> None:
     table = dynamodb.Table(INCIDENTS_TABLE)
     table.update_item(
         Key={"incident_id": incident_id, "timestamp": "latest"},
         UpdateExpression="SET hazmat_result = :h, hazmat_at_ms = :ts",
-        ExpressionAttributeValues={":h": result, ":ts": t0},
+        ExpressionAttributeValues={":h": _to_dynamo(result), ":ts": t0},
     )
 
 
@@ -225,9 +237,11 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
         KeyConditionExpression="incident_id = :iid",
         ExpressionAttributeValues={":iid": incident_id},
     ).get("Items", [])
-    data = json.dumps(payload).encode()
+    data = json.dumps(payload, default=str).encode()
     for conn in conns:
         try:
             apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+        except apigw_mgmt.exceptions.GoneException:
+            conn_table.delete_item(Key={"connection_id": conn["connection_id"]})
         except Exception:
             pass

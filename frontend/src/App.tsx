@@ -39,6 +39,17 @@ const WS_BASE  = (import.meta.env.VITE_WS_URL ?? "").replace(/\/$/, "");
 // ?demo=1  →  local frontend simulation, no backend required
 const IS_DEMO = new URLSearchParams(window.location.search).get("demo") === "1";
 
+type UiSeverity = "critical" | "urgent" | "nonurgent";
+type ConfidenceLabel = "HIGH" | "MEDIUM" | "LOW";
+
+// Backend emits critical|urgent|moderate|minor → UI uses critical|urgent|nonurgent
+function mapSeverity(s: string | undefined): UiSeverity {
+  if (s === "critical") return "critical";
+  if (s === "urgent" || s === "moderate") return "urgent";
+  if (s === "minor") return "nonurgent";
+  return "critical";
+}
+
 type AgentStates = Record<AgentId, AgentState>;
 type AgentLogs   = Record<AgentId, LogLine[]>;
 
@@ -93,7 +104,13 @@ export default function App() {
   const [toast,           setToast]           = useState<Toast | null>(null);
   const [sessionComplete, setSessionComplete] = useState(false);
   const [reportUrl,       setReportUrl]       = useState<string | null>(null);
+  const [severity,        setSeverity]        = useState<UiSeverity>("critical");
+  const [confidenceLabel, setConfidenceLabel] = useState<ConfidenceLabel>("HIGH");
+  const [, setIncidentType]                   = useState<string | null>(null);
   const wordPulses = useRef<Array<{ at: number; idx: number }>>([]);
+  // Server-clock epoch of the first transcript word — used to render relative
+  // timestamps without mixing the browser clock with the Lambda clock.
+  const firstWordTsRef = useRef<number>(0);
 
   // =========================================================================
   // TOAST
@@ -141,8 +158,12 @@ export default function App() {
     setReportUrl(null);
     setRecSummary(null);
     setRecAddress(null);
+    setSeverity("critical");
+    setConfidenceLabel("HIGH");
+    setIncidentType(null);
     setShowUploadModal(true);
     sessionStartEpochRef.current = 0;
+    firstWordTsRef.current = 0;
     wordPulses.current = [];
   }, []);
 
@@ -171,8 +192,13 @@ export default function App() {
         wordPulses.current.push({ at: performance.now(), idx: Math.floor(Math.random() * 56) });
         break;
       case "transcript_word": {
-        const relSec = sessionStartEpochRef.current
-          ? (ev.timestamp_ms - sessionStartEpochRef.current) / 1000
+        // Anchor to the first word's *server* timestamp so we never subtract a
+        // browser clock from a Lambda clock (which produced bunched 00:00 times).
+        if (!firstWordTsRef.current && ev.timestamp_ms) {
+          firstWordTsRef.current = ev.timestamp_ms;
+        }
+        const relSec = firstWordTsRef.current
+          ? (ev.timestamp_ms - firstWordTsRef.current) / 1000
           : 0;
         setTranscript((prev) => [
           ...prev,
@@ -235,7 +261,8 @@ export default function App() {
             setNavData({
               unit:      u.unit_id      ?? res.unit_id ?? "",
               unit_type: u.unit_type    ?? "",
-              eta_min:   u.eta_min      ?? res.eta_min ?? 0,
+              // backend field is eta_minutes (eta_min kept for sim compatibility)
+              eta_min:   u.eta_minutes  ?? u.eta_min ?? res.eta_minutes ?? res.eta_min ?? 0,
               station:   u.station      ?? "",
               elapsed:   res.elapsed_ms != null ? `${(res.elapsed_ms / 1000).toFixed(1)}s` : "",
             } as NavData);
@@ -243,20 +270,28 @@ export default function App() {
         }
         if (ag === "medical" && (res.recommended_hospital || res.hospital_name)) {
           const h = res.recommended_hospital ?? res;
+          // pre_alert_status carries the mock-hospital reply (accepting/preparing + notes)
+          const preAlert = res.pre_alert_status ?? {};
           setMedData({
-            hospital:  h.hospital_name ?? h.name ?? res.hospital_name ?? "",
-            eta_min:   h.eta_min       ?? res.eta_min ?? 0,
-            status:    h.status        ?? "",
-            bay:       h.bay           ?? "",
+            hospital:  h.name          ?? h.hospital_name ?? res.hospital_name ?? "",
+            eta_min:   h.eta_minutes   ?? h.eta_min ?? res.eta_minutes ?? 0,
+            status:    preAlert.status ?? h.er_status ?? h.status ?? "",
+            bay:       preAlert.notes  ?? h.bay ?? "",
             protocol:  res.triage_protocol ?? res.protocol_text ?? "",
             elapsed:   res.elapsed_ms != null ? `${(res.elapsed_ms / 1000).toFixed(1)}s` : "",
           } as MedData);
         }
-        if (ag === "hazmat" && (res.hazard_warnings || res.evacuation_radius_m)) {
+        if (ag === "hazmat" && (res.hazard_warnings || res.evacuation_radius_meters || res.suppression_approach)) {
           setHazData({
-            summary:             res.summary             ?? "",
-            evacuation_radius_m: res.evacuation_radius_m ?? undefined,
-            gear:                res.gear                ?? undefined,
+            // backend keys: priority_action / suppression_approach / hazard_warnings[]
+            summary:
+              res.priority_action ??
+              res.suppression_approach ??
+              (Array.isArray(res.hazard_warnings) ? res.hazard_warnings.join("; ") : "") ??
+              "",
+            // backend key is evacuation_radius_meters; protective_equipment is the PPE list
+            evacuation_radius_m: res.evacuation_radius_meters ?? res.evacuation_radius_m ?? undefined,
+            gear:                res.protective_equipment ?? res.gear ?? undefined,
           } as HazData);
         }
         break;
@@ -267,6 +302,21 @@ export default function App() {
         const card = (ev as any).card ?? {};
         if (card.summary)           setRecSummary(card.summary);
         if (card.reasoning_summary) setReasoning(card.reasoning_summary);
+        if (card.severity)          setSeverity(mapSeverity(card.severity));
+        if (card.incident_type) {
+          setIncidentType(card.incident_type);
+          // If the incident isn't fire/hazmat and the hazmat agent never ran,
+          // mark it "skipped" so the card shows NOT TRIGGERED instead of PENDING.
+          setAgentStates((prev) =>
+            prev.hazmat === "idle" && !["fire", "hazmat"].includes(card.incident_type)
+              ? { ...prev, hazmat: "skipped" }
+              : prev
+          );
+        }
+        const lbl: ConfidenceLabel =
+          card.ai_confidence === "high" ? "HIGH"
+          : card.ai_confidence === "medium" ? "MEDIUM" : "LOW";
+        setConfidenceLabel(lbl);
         const conf = card.ai_confidence === "high" ? 0.88
                    : card.ai_confidence === "medium" ? 0.62 : 0.38;
         animateConfidence(conf);
@@ -274,6 +324,51 @@ export default function App() {
         setTimeline((prev) => [...prev, { t: 0, icon: "✓", label: "Recommendation card ready" }]);
         break;
       }
+
+      case "report_generated":
+        if (ev.report_url) {
+          setReportUrl(ev.report_url);
+          showToast("After-action report ready — download in RecCard", "ok");
+        }
+        setSessionComplete(true);
+        setTimeline((prev) => [
+          ...prev,
+          { t: 0, icon: "✓", label: "After-action report generated → S3" },
+        ]);
+        break;
+
+      case "context_enrichment": {
+        const cls = ev.verifier_classification ?? ev.classification ?? {};
+        if (cls && cls.severity) setSeverity(mapSeverity(cls.severity));
+        const refined = ev.refined_incident_type;
+        if (refined) {
+          setIncidentType(refined);
+          setAgentStates((prev) =>
+            prev.hazmat === "idle" && !["fire", "hazmat"].includes(refined)
+              ? { ...prev, hazmat: "skipped" }
+              : prev
+          );
+        }
+        break;
+      }
+
+      case "partial_approval_available":
+        // Navigation returned for a critical incident — the "Dispatch Unit Now"
+        // button is already visible via navData; surface a timeline hint.
+        setTimeline((prev) => [
+          ...prev,
+          { t: 0, icon: "⚡", label: "Partial approval available — Dispatch Unit Now" },
+        ]);
+        break;
+
+      case "guardrail_blocked":
+        showToast("Recommendation withheld by safety guardrail", "urgent");
+        setReasoning(ev.fallback ?? "Recommendation blocked by guardrail — manual protocol required.");
+        setTimeline((prev) => [
+          ...prev,
+          { t: 0, icon: "✗", label: "Guardrail blocked recommendation" },
+        ]);
+        break;
 
       case "partial_approval":
         // handled via rec_ready / approved events
@@ -332,8 +427,14 @@ export default function App() {
       try {
         const r = await fetch(`${API_BASE}/session/${iid}/status`);
         if (!r.ok) return;
-        const data = await r.json() as { status: string };
-        if (data.status === "complete" || data.status === "failed") {
+        const data = await r.json() as { status?: string; report_generated?: unknown };
+        // Backend terminal states: transcript_complete (call done) or report indexed.
+        if (
+          data.status === "complete" ||
+          data.status === "failed" ||
+          data.status === "transcript_complete" ||
+          data.report_generated
+        ) {
           if (pollRef.current) clearInterval(pollRef.current);
           pollRef.current = null;
         }
@@ -703,7 +804,8 @@ export default function App() {
         await fetch(`${API_BASE}/session/${incidentId}/override`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ reason, notes }),
+          // backend reads override_reason / notes
+          body: JSON.stringify({ override_reason: reason, reason, notes }),
         });
         setTimeline((prev) => [
           ...prev,
@@ -751,7 +853,7 @@ export default function App() {
 
       <TopBar
         elapsedMs={elapsedMs}
-        severity="critical"
+        severity={severity}
         incidentId={
           incidentId
             ? `INC-${incidentId.slice(0, 8).toUpperCase()}`
@@ -798,7 +900,7 @@ export default function App() {
           <DispatchedUnits units={units} partialApproved={partialApproved} />
         )}
         <RecCard
-          severity="critical"
+          severity={severity}
           summary={recSummary ?? "Awaiting incident analysis…"}
           address={recAddress ?? "Locating incident…"}
           recState={recState}
@@ -807,6 +909,7 @@ export default function App() {
           hazState={agentStates.hazmat}
           hazData={hazData}
           confidence={confidence}
+          confidenceLabel={confidenceLabel}
           reasoning={reasoning}
           onDispatch={onDispatch}
           onApproveAll={onApproveAll}

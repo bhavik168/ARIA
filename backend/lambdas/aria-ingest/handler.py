@@ -146,7 +146,8 @@ def _start_session(event: dict, context) -> dict:
     if simulation_transcript:
         # Async self-invoke so this response returns to the frontend BEFORE words start
         # flowing. The frontend opens the WebSocket, ws-connect registers the connection,
-        # and only then (after the 3s sleep in the handler) do words arrive.
+        # and the replay handler waits (via _wait_for_ws_connection) until that
+        # registration is visible before firing the first word.
         lambda_client.invoke(
             FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "aria-ingest"),
             InvocationType="Event",
@@ -215,8 +216,9 @@ def _wait_for_ws_connection(incident_id: str, max_wait_ms: int = 2000) -> bool:
                 logger.info("WS connection detected, starting replay", extra={"incident_id": incident_id})
                 return True
         except Exception as e:
-            logger.warning("WS connection check failed (non-fatal), proceeding with replay", exc_info=e)
-            return False
+            # A transient query error shouldn't abort the wait — keep retrying until
+            # the deadline so we don't fire the first words before the browser registers.
+            logger.warning("WS connection check failed (will retry)", exc_info=e)
         time.sleep(0.15)
     logger.warning("WS connection not detected within timeout, starting replay anyway", extra={"incident_id": incident_id})
     return False
@@ -228,6 +230,7 @@ def _replay_simulation(incident_id: str, transcript: list, t0_ms: int) -> None:
     Each entry: { word, speaker (optional), delay_ms (optional) }
     """
     first_word_fired = False
+    accumulated_words: list[str] = []
     for entry in transcript:
         word = entry.get("word", "").strip()
         if not word:
@@ -236,12 +239,17 @@ def _replay_simulation(incident_id: str, transcript: list, t0_ms: int) -> None:
         delay_ms = entry.get("delay_ms", 300)
         time.sleep(delay_ms / 1000)
 
+        accumulated_words.append(word)
         ts = int(time.time() * 1000)
         payload = {
             "incident_id": incident_id,
             "word": word,
             "speaker_label": entry.get("speaker", "caller"),
             "timestamp_ms": ts,
+            # Authoritative cumulative transcript so the stream processor never
+            # depends on fragile in-memory state across fan-out containers.
+            "context_so_far": " ".join(accumulated_words),
+            "word_index": len(accumulated_words),
         }
 
         try:
@@ -290,7 +298,7 @@ def _start_transcribe_job(incident_id: str, audio_key: str, job_name: str, t0_ms
     transcribe_client.start_transcription_job(
         TranscriptionJobName=job_name,
         Media={"MediaFileUri": media_uri},
-        MediaFormat="wav",  # assumes wav — adjust for mp3/mp4 if needed
+        MediaFormat=_media_format_for_key(audio_key),
         LanguageCode="en-US",
         Settings={
             "ShowSpeakerLabels": True,
@@ -321,6 +329,17 @@ def _start_transcribe_job(incident_id: str, audio_key: str, job_name: str, t0_ms
     )
 
 
+def _media_format_for_key(audio_key: str) -> str:
+    """Pick a valid Amazon Transcribe MediaFormat from the file extension."""
+    ext = audio_key.rsplit(".", 1)[-1].lower() if "." in audio_key else "wav"
+    # Transcribe accepts: mp3, mp4, wav, flac, ogg, amr, webm
+    if ext in ("mp3", "mp4", "wav", "flac", "ogg", "amr", "webm"):
+        return ext
+    if ext in ("m4a", "mov"):
+        return "mp4"
+    return "wav"
+
+
 def poll_and_replay_transcript(incident_id: str, job_name: str, t0_ms: int) -> dict:
     """
     Poll Transcribe until complete, then replay words through stream-processor.
@@ -340,9 +359,11 @@ def poll_and_replay_transcript(incident_id: str, job_name: str, t0_ms: int) -> d
 
     # Read directly from the known S3 key — avoids parsing the URI format
     transcript_key = f"transcripts/{incident_id}/{job_name}.json"
-    words = _fetch_transcript_words_s3(ARIA_BUCKET, transcript_key)
+    words, speaker_by_start = _fetch_transcript_words_s3(ARIA_BUCKET, transcript_key)
 
     first = True
+    prev_start = 0.0
+    accumulated_words: list[str] = []
     for word_item in words:
         word = word_item.get("alternatives", [{}])[0].get("content", "")
         word_type = word_item.get("type", "")
@@ -350,14 +371,25 @@ def poll_and_replay_transcript(incident_id: str, job_name: str, t0_ms: int) -> d
             continue
 
         start_time = float(word_item.get("start_time", 0))
-        speaker = word_item.get("speaker_label", "spk_0")
+        # Transcribe stores speaker labels in results.speaker_labels.segments, keyed
+        # by item start_time — not on the word items themselves.
+        speaker = speaker_by_start.get(word_item.get("start_time"), "spk_0")
         ts_ms = t0_ms + int(start_time * 1000)
 
+        # Pace replay to the real word timing (capped) so the dashboard streams
+        # word-by-word in order instead of a single burst of invocations.
+        gap = max(0.0, start_time - prev_start)
+        prev_start = start_time
+        time.sleep(min(gap, 1.0))
+
+        accumulated_words.append(word)
         payload = {
             "incident_id": incident_id,
             "word": word,
             "speaker_label": "caller" if speaker == "spk_0" else "dispatcher",
             "timestamp_ms": ts_ms,
+            "context_so_far": " ".join(accumulated_words),
+            "word_index": len(accumulated_words),
         }
         lambda_client.invoke(
             FunctionName=STREAM_PROCESSOR_FUNCTION,
@@ -394,11 +426,25 @@ def poll_and_replay_transcript(incident_id: str, job_name: str, t0_ms: int) -> d
     return {"status": "ok", "words_replayed": len(words)}
 
 
-def _fetch_transcript_words_s3(bucket: str, key: str) -> list:
-    """Fetch Transcribe output directly from S3 using known bucket/key."""
+def _fetch_transcript_words_s3(bucket: str, key: str) -> tuple[list, dict]:
+    """Fetch Transcribe output from S3.
+
+    Returns (items, speaker_by_start) where speaker_by_start maps an item's
+    start_time string to its speaker_label (spk_0, spk_1, ...).
+    """
     resp = s3_client.get_object(Bucket=bucket, Key=key)
     data = json.loads(resp["Body"].read())
-    return data.get("results", {}).get("items", [])
+    results = data.get("results", {})
+    items = results.get("items", [])
+
+    speaker_by_start: dict[str, str] = {}
+    for seg in results.get("speaker_labels", {}).get("segments", []):
+        for seg_item in seg.get("items", []):
+            start = seg_item.get("start_time")
+            label = seg_item.get("speaker_label")
+            if start and label:
+                speaker_by_start[start] = label
+    return items, speaker_by_start
 
 
 def _fetch_transcript_words(transcript_uri: str) -> list:

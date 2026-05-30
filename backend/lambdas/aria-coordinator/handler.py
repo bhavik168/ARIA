@@ -9,6 +9,7 @@ import json
 import os
 import time
 import concurrent.futures
+from decimal import Decimal
 import boto3
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
@@ -55,6 +56,9 @@ AGENT_TIMEOUTS = {
     "report": 30,
 }
 
+# Minimum gap between non-final coordinator syntheses for one incident.
+SYNTHESIS_THROTTLE_MS = 8000
+
 
 @logger.inject_lambda_context
 def lambda_handler(event, context):
@@ -81,6 +85,17 @@ def lambda_handler(event, context):
 
     if not incident_id:
         return {"status": "skipped"}
+
+    # Idempotency: the stream processor fires the coordinator repeatedly (word 25,
+    # then every 60 words) plus once at transcript_complete. Without a guard each
+    # trigger re-runs all specialist agents + a Sonnet synthesis, racing cards onto
+    # the dashboard. transcript_complete (the final card) always runs; intermediate
+    # triggers are throttled to one synthesis per window.
+    if not _acquire_synthesis_slot(incident_id, trigger_reason):
+        logger.info("Coordinator throttled — recent synthesis in flight", extra={
+            "incident_id": incident_id, "trigger": trigger_reason,
+        })
+        return {"status": "throttled", "incident_id": incident_id}
 
     logger.info("Coordinator starting", extra={"incident_id": incident_id, "trigger": trigger_reason})
     _push_to_dashboard(incident_id, {"type": "agent_started", "agent": "coordinator"})
@@ -109,11 +124,59 @@ def lambda_handler(event, context):
     _save_recommendation(incident_id, card)
     _push_to_dashboard(incident_id, {"type": "recommendation_ready", "card": card})
 
+    # When the call is over, generate the after-action report (writes to S3 and emits
+    # report_generated to the dashboard). Fire-and-forget so synthesis returns promptly.
+    if trigger_reason == "transcript_complete":
+        _generate_after_action_report(incident_id)
+
     elapsed = int(time.time() * 1000) - t0
     metrics.add_metric("coordinator_card_complete_ms", unit=MetricUnit.Milliseconds, value=elapsed)
     logger.info("Coordinator card complete", extra={"incident_id": incident_id, "ms": elapsed})
 
     return {"status": "ok", "incident_id": incident_id, "card": card}
+
+
+def _acquire_synthesis_slot(incident_id: str, trigger_reason: str) -> bool:
+    """Throttle overlapping coordinator runs via a conditional DynamoDB write.
+
+    transcript_complete always proceeds (it produces the final card). Other triggers
+    acquire the slot only if no synthesis has run in the last SYNTHESIS_THROTTLE_MS.
+    """
+    if trigger_reason == "transcript_complete":
+        return True
+    now = int(time.time() * 1000)
+    cutoff = now - SYNTHESIS_THROTTLE_MS
+    table = dynamodb.Table(INCIDENTS_TABLE)
+    try:
+        table.update_item(
+            Key={"incident_id": incident_id, "timestamp": "latest"},
+            UpdateExpression="SET coordinator_lock_ms = :now",
+            ConditionExpression="attribute_not_exists(coordinator_lock_ms) OR coordinator_lock_ms < :cutoff",
+            ExpressionAttributeValues={":now": now, ":cutoff": cutoff},
+        )
+        return True
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+    except Exception as e:
+        # If the lock write fails for any other reason, don't block synthesis.
+        logger.warning("Synthesis slot check failed — proceeding", exc_info=e)
+        return True
+
+
+def _generate_after_action_report(incident_id: str) -> None:
+    """Async-invoke the report Lambda to produce the after-action report."""
+    try:
+        lambda_client.invoke(
+            FunctionName=REPORT_FUNCTION,
+            InvocationType="Event",
+            Payload=json.dumps({
+                "incident_id": incident_id,
+                "action": "generate_report",
+            }).encode(),
+        )
+        logger.info("After-action report requested", extra={"incident_id": incident_id})
+    except Exception as e:
+        logger.error("Failed to invoke report agent", exc_info=e)
 
 
 def _handle_agent_action(event: dict) -> dict:
@@ -191,6 +254,9 @@ def _run_specialist_agents(incident_id: str, context: str, incident_data: dict, 
 
     def _invoke_sync(agent_name: str, fn_name: str, payload: dict, agent_id: str, alias_id: str) -> tuple:
         start = time.time()
+        # Flip the agent's card to "Running" on the dashboard before it starts.
+        if agent_name != "report":
+            _push_to_dashboard(incident_id, {"type": "agent_started", "agent": agent_name})
         try:
             if agent_id and alias_id:
                 result = _invoke_via_bedrock_agent(
@@ -222,15 +288,26 @@ def _run_specialist_agents(incident_id: str, context: str, incident_data: dict, 
             pool.submit(_invoke_sync, name, fn, payload, agent_id, alias_id): name
             for name, (fn, payload, agent_id, alias_id) in agents_to_run.items()
         }
-        for future in concurrent.futures.as_completed(futures, timeout=max(AGENT_TIMEOUTS.values())):
-            name, result = future.result()
-            results[name] = result
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=max(AGENT_TIMEOUTS.values())):
+                name, result = future.result()
+                results[name] = result
 
-            if name == "navigation" and incident_data.get("severity") == "critical":
-                _push_to_dashboard(incident_id, {
-                    "type": "partial_approval_available",
-                    "unit": result.get("recommended_unit"),
-                })
+                if name == "navigation" and incident_data.get("severity") == "critical":
+                    _push_to_dashboard(incident_id, {
+                        "type": "partial_approval_available",
+                        "unit": result.get("recommended_unit"),
+                    })
+        except concurrent.futures.TimeoutError:
+            # One or more agents exceeded the budget — synthesize with what we have
+            # instead of failing the whole card.
+            logger.warning("Specialist agent(s) timed out — proceeding with partial results", extra={
+                "incident_id": incident_id,
+            })
+
+    # Backfill any agent that didn't return so synthesis sees an explicit status.
+    for name in agents_to_run:
+        results.setdefault(name, {"status": "timed_out"})
 
     return results
 
@@ -343,7 +420,9 @@ def _synthesize_card(incident_id: str, context: str, results: dict, incident_dat
 
 
 def _synthesize_card_fallback(nav: dict, med: dict, haz: dict, context: str) -> dict:
-    agents_ok = all(r.get("status") == "ok" for r in (nav, med) if r)
+    # Judge confidence only over agents that actually ran for this incident.
+    ran = [r for r in (nav, med, haz) if r and r.get("status")]
+    agents_ok = bool(ran) and all(r.get("status") == "ok" for r in ran)
     confidence = "high" if agents_ok else "low"
     return {
         "incident_type": nav.get("incident_type", "unknown"),
@@ -353,7 +432,8 @@ def _synthesize_card_fallback(nav: dict, med: dict, haz: dict, context: str) -> 
         "triage_protocol": med.get("triage_protocol"),
         "hazard_warnings": haz.get("hazard_warnings", []),
         "ai_confidence": confidence,
-        "reasoning_summary": "Fallback synthesis — Sonnet unavailable.",
+        # Dispatcher-facing copy — no internal "Sonnet unavailable" leakage.
+        "reasoning_summary": "Recommendation compiled from available agent results.",
     }
 
 
@@ -384,9 +464,10 @@ def _apply_guardrail(card: dict) -> tuple[bool, str]:
         )
         action = resp.get("action", "NONE")
         if action == "GUARDRAIL_INTERVENED":
-            outputs = resp.get("outputs", [])
-            reason = outputs[0].get("text", "policy violation") if outputs else "policy violation"
-            return True, reason
+            # Don't surface the guardrail's masked output text to the dispatcher —
+            # report the policy category instead, and log the detail server-side.
+            logger.info("Guardrail intervened", extra={"assessments": resp.get("assessments", [])})
+            return True, "content policy violation"
         return False, ""
     except Exception as e:
         # Guardrail failure is non-fatal — log and continue
@@ -509,12 +590,27 @@ def _load_incident(incident_id: str) -> dict:
     return result.get("Items", [{}])[0]
 
 
+def _to_dynamo(obj):
+    """Recursively convert float → Decimal for DynamoDB compatibility."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _to_dynamo(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_dynamo(v) for v in obj]
+    return obj
+
+
 def _save_recommendation(incident_id: str, card: dict) -> None:
     table = dynamodb.Table(INCIDENTS_TABLE)
+    now = int(time.time() * 1000)
     table.update_item(
         Key={"incident_id": incident_id, "timestamp": "latest"},
-        UpdateExpression="SET recommendation_card = :card, recommendation_ready = :t",
-        ExpressionAttributeValues={":card": card, ":t": True},
+        UpdateExpression=(
+            "SET recommendation_card = :card, recommendation_ready = :t, "
+            "recommendation_ready_at_ms = :ts"
+        ),
+        ExpressionAttributeValues={":card": _to_dynamo(card), ":t": True, ":ts": now},
     )
 
 
@@ -536,10 +632,13 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
             KeyConditionExpression="incident_id = :iid",
             ExpressionAttributeValues={":iid": incident_id},
         ).get("Items", [])
-        data = json.dumps(payload).encode()
+        data = json.dumps(payload, default=str).encode()
         for conn in conns:
             try:
                 apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+            except apigw_mgmt.exceptions.GoneException:
+                # Drop dead connections so we stop re-pushing to them.
+                conn_table.delete_item(Key={"connection_id": conn["connection_id"]})
             except Exception:
                 pass
     except Exception as e:

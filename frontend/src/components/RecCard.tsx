@@ -18,6 +18,7 @@ interface RecCardProps {
   hazState: AgentState;
   hazData: HazData | null;
   confidence: number;
+  confidenceLabel?: "HIGH" | "MEDIUM" | "LOW";
   reasoning: string;
   onDispatch: () => void;
   onApproveAll: () => void;
@@ -87,6 +88,7 @@ export default function RecCard({
   hazState,
   hazData,
   confidence,
+  confidenceLabel = "HIGH",
   reasoning,
   onDispatch,
   onApproveAll,
@@ -391,13 +393,30 @@ export default function RecCard({
                   style={{
                     height: "100%",
                     width: `${confidence * 100}%`,
-                    background: "linear-gradient(90deg, #15803d 0%, #16a34a 100%)",
+                    background:
+                      confidenceLabel === "HIGH"
+                        ? "linear-gradient(90deg, #15803d 0%, #16a34a 100%)"
+                        : confidenceLabel === "MEDIUM"
+                        ? "linear-gradient(90deg, #b45309 0%, #d97706 100%)"
+                        : "linear-gradient(90deg, #b91c1c 0%, #dc2626 100%)",
                     transition: "width 0.6s ease-out",
                   }}
                 />
               </div>
-              <span className="mono" style={{ fontSize: 11, color: "#15803d", fontWeight: 600 }}>
-                {(confidence * 100).toFixed(0)}% · HIGH
+              <span
+                className="mono"
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color:
+                    confidenceLabel === "HIGH"
+                      ? "#15803d"
+                      : confidenceLabel === "MEDIUM"
+                      ? "#a16207"
+                      : "#b91c1c",
+                }}
+              >
+                {(confidence * 100).toFixed(0)}% · {confidenceLabel}
               </span>
             </>
           ) : (

@@ -128,11 +128,26 @@ def lambda_handler(event, context):
     if not incident_id or not word:
         return {"status": "skipped"}
 
-    # Step 1 — Append to context buffer
-    _context_buffer.setdefault(incident_id, "")
-    _context_buffer[incident_id] += f" {word}"
-    _word_count[incident_id] = _word_count.get(incident_id, 0) + 1
-    context_so_far = _context_buffer[incident_id].strip()
+    # Step 1 — Establish the running context.
+    # Words arrive as independent async (Event) invocations that AWS may spread across
+    # multiple warm containers, so a purely in-memory buffer fragments and reorders.
+    # aria-ingest now passes the authoritative cumulative transcript (context_so_far)
+    # and word_index with each word; prefer those and fall back to the in-memory buffer
+    # only for legacy callers that don't send them.
+    incoming_context = event.get("context_so_far")
+    incoming_index = event.get("word_index")
+    if incoming_context is not None:
+        context_so_far = incoming_context.strip()
+        _context_buffer[incident_id] = " " + context_so_far
+        _word_count[incident_id] = (
+            int(incoming_index) if incoming_index is not None
+            else len(context_so_far.split())
+        )
+    else:
+        _context_buffer.setdefault(incident_id, "")
+        _context_buffer[incident_id] += f" {word}"
+        _word_count[incident_id] = _word_count.get(incident_id, 0) + 1
+        context_so_far = _context_buffer[incident_id].strip()
 
     # Async checkpoint write every 10 words (non-blocking)
     if _word_count[incident_id] % 10 == 0:
@@ -251,8 +266,27 @@ def _check_keywords(text: str, keyword_set: frozenset) -> bool:
     return any(kw in text for kw in keyword_set)
 
 
+def _agent_name_for_function(function_name: str) -> str:
+    """Map a Lambda function name to the dashboard agent id."""
+    fn = function_name.lower()
+    if "navigation" in fn:
+        return "navigation"
+    if "medical" in fn:
+        return "medical"
+    if "hazmat" in fn:
+        return "hazmat"
+    if "coordinator" in fn:
+        return "coordinator"
+    return "agent"
+
+
 def _fire_agent(function_name: str, incident_id: str, context: str, trigger_reason: str, ts: int) -> None:
     """Async invoke — stream processor returns immediately, agent runs in parallel."""
+    # Flip the agent card to "Running" on the dashboard the moment a watcher fires it.
+    _push_to_dashboard(incident_id, {
+        "type": "agent_started",
+        "agent": _agent_name_for_function(function_name),
+    })
     payload = {
         "incident_id": incident_id,
         "context_so_far": context,

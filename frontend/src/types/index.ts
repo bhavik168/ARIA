@@ -242,6 +242,35 @@ export interface BackendEventRecommendationReady {
   card: Record<string, any>;
 }
 
+export interface BackendEventReportGenerated {
+  type: "report_generated";
+  report_url?: string;
+  incident_id?: string;
+}
+
+export interface BackendEventContextEnrichment {
+  type: "context_enrichment";
+  source?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  classification?: Record<string, any>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  verifier_classification?: Record<string, any>;
+  refined_incident_type?: string;
+  refined_severity?: string;
+}
+
+export interface BackendEventPartialApprovalAvailable {
+  type: "partial_approval_available";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  unit?: Record<string, any> | null;
+}
+
+export interface BackendEventGuardrailBlocked {
+  type: "guardrail_blocked";
+  reason?: string;
+  fallback?: string;
+}
+
 export type DashboardEvent =
   | SimEventAgent
   | SimEventLog
@@ -257,4 +286,8 @@ export type DashboardEvent =
   | BackendEventTranscriptWord
   | BackendEventAgentStarted
   | BackendEventAgentComplete
-  | BackendEventRecommendationReady;
+  | BackendEventRecommendationReady
+  | BackendEventReportGenerated
+  | BackendEventContextEnrichment
+  | BackendEventPartialApprovalAvailable
+  | BackendEventGuardrailBlocked;

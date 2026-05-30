@@ -63,7 +63,8 @@ def lambda_handler(event, context):
     elapsed_ms = int(time.time() * 1000) - t0
     metrics.add_metric("report_complete_ms", unit=MetricUnit.Milliseconds, value=elapsed_ms)
 
-    report_url = f"s3://{ARIA_BUCKET}/{report_key}" if ARIA_BUCKET else ""
+    # Browser-openable presigned GET URL (the raw s3:// URI isn't fetchable from the UI).
+    report_url = _presigned_get(md_key)
     _push_to_dashboard(incident_id, {
         "type": "report_generated",
         "report_url": report_url,
@@ -88,7 +89,7 @@ def _handle_agent_action(event: dict) -> dict:
     _write_to_s3(md_key, _render_markdown(report, incident))
     _index_report(incident_id, report_key, md_key)
 
-    report_url = f"s3://{ARIA_BUCKET}/{report_key}" if ARIA_BUCKET else ""
+    report_url = _presigned_get(md_key)
     _push_to_dashboard(incident_id, {"type": "report_generated", "report_url": report_url, "incident_id": incident_id})
 
     return {
@@ -238,6 +239,21 @@ def _write_to_s3(key: str, content: str) -> None:
     )
 
 
+def _presigned_get(key: str, expires_in: int = 3600) -> str:
+    """Return a browser-openable presigned GET URL for an S3 object."""
+    if not ARIA_BUCKET:
+        return ""
+    try:
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": ARIA_BUCKET, "Key": key},
+            ExpiresIn=expires_in,
+        )
+    except Exception as e:
+        logger.warning("Failed to presign report URL", exc_info=e)
+        return f"s3://{ARIA_BUCKET}/{key}"
+
+
 def _index_report(incident_id: str, json_key: str, md_key: str) -> None:
     table = dynamodb.Table(INCIDENTS_TABLE)
     table.update_item(
@@ -268,9 +284,11 @@ def _push_to_dashboard(incident_id: str, payload: dict) -> None:
         KeyConditionExpression="incident_id = :iid",
         ExpressionAttributeValues={":iid": incident_id},
     ).get("Items", [])
-    data = json.dumps(payload).encode()
+    data = json.dumps(payload, default=str).encode()
     for conn in conns:
         try:
             apigw_mgmt.post_to_connection(ConnectionId=conn["connection_id"], Data=data)
+        except apigw_mgmt.exceptions.GoneException:
+            conn_table.delete_item(Key={"connection_id": conn["connection_id"]})
         except Exception:
             pass
